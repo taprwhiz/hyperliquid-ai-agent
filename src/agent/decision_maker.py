@@ -31,6 +31,7 @@ class TradingAgent:
             "- per-asset intraday (5m) and higher-timeframe (4h) metrics\n"
             "- Active Trades with Exit Plans\n"
             "- Recent Trading History\n\n"
+            "Always use the 'current time' provided in the user message to evaluate any time-based conditions, such as cooldown expirations or timed exit plans.\n\n"
             "Your goal: make decisive, first-principles decisions per asset that minimize churn while capturing edge.\n\n"
             "Core policy (low-churn, position-aware)\n"
             "1) Respect prior plans: If an active trade has an exit_plan with explicit invalidation (e.g., “close if 4h close above EMA50”), DO NOT close or flip early unless that invalidation (or a stronger one) has occurred.\n"
@@ -50,6 +51,10 @@ class TradingAgent:
             "  • SELL: tp_price < current_price, sl_price > current_price\n"
             "  If sensible TP/SL cannot be set, use null and explain the logic.\n"
             "- exit_plan must include at least ONE explicit invalidation trigger and may include cooldown guidance you will follow later.\n\n"
+            "Leverage policy (perpetual futures)\n"
+            "- You may use leverage\n"
+            "- In high volatility (elevated ATR) or during funding spikes, reduce or avoid leverage.\n"
+            "- Treat allocation_usd as notional exposure; keep it consistent with safe leverage and available margin.\n\n"
             "Tool usage\n"
             "- Call fetch_taapi_indicator ONLY if one specific reading would materially change your decision. Keep parameters minimal (indicator, symbol like \"BTC/USDT\", interval \"5m\"/\"4h\", optional period).\n\n"
             "Reasoning recipe (first principles)\n"
@@ -116,8 +121,49 @@ class TradingAgent:
             return resp.json()
 
         allow_tools = True
+        allow_structured = True
+
+        def _build_schema():
+            base_properties = {
+                "asset": {"type": "string", "enum": assets},
+                "action": {"type": "string", "enum": ["buy", "sell", "hold"]},
+                "allocation_usd": {"type": "number", "minimum": 0},
+                "tp_price": {"type": ["number", "null"]},
+                "sl_price": {"type": ["number", "null"]},
+                "exit_plan": {"type": "string"},
+                "rationale": {"type": "string"},
+            }
+            required_keys = ["asset", "action", "allocation_usd", "tp_price", "sl_price", "exit_plan", "rationale"]
+            if is_multi:
+                return {
+                    "type": "array",
+                    "items": {
+                        "type": "object",
+                        "properties": base_properties,
+                        "required": required_keys,
+                        "additionalProperties": False,
+                    },
+                    "minItems": 1,
+                }
+            else:
+                return {
+                    "type": "object",
+                    "properties": base_properties,
+                    "required": required_keys,
+                    "additionalProperties": False,
+                }
+
         for _ in range(6):
             data = {"model": self.model, "messages": messages}
+            if allow_structured:
+                data["response_format"] = {
+                    "type": "json_schema",
+                    "json_schema": {
+                        "name": "trade_decisions",
+                        "strict": True,
+                        "schema": _build_schema(),
+                    },
+                }
             if allow_tools:
                 data["tools"] = tools
                 data["tool_choice"] = "auto"
@@ -135,6 +181,12 @@ class TradingAgent:
                     if allow_tools:
                         allow_tools = False
                         continue
+                # Provider may not support structured outputs / response_format
+                err_text = json.dumps(err)
+                if allow_structured and ("response_format" in err_text or "structured" in err_text or e.response.status_code in (400, 422)):
+                    logging.warning("Provider rejected structured outputs; retrying without response_format.")
+                    allow_structured = False
+                    continue
                 raise
 
             choice = resp_json["choices"][0]
@@ -176,8 +228,12 @@ class TradingAgent:
                 continue
 
             try:
-                content = message.get("content") or "{}"
-                parsed = json.loads(content)
+                # Prefer parsed field from structured outputs if present
+                if isinstance(message.get("parsed"), (dict, list)):
+                    parsed = message.get("parsed")
+                else:
+                    content = message.get("content") or "{}"
+                    parsed = json.loads(content)
                 if is_multi:
                     if isinstance(parsed, list):
                         result = []

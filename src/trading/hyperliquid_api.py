@@ -77,6 +77,23 @@ class HyperliquidAPI:
             logging.error(f"Get open orders error: {e}")
             return []
 
+    async def get_recent_fills(self, limit: int = 50):
+        """Return recent fills/trades if supported by SDK; otherwise empty list."""
+        try:
+            # Some SDK versions expose user_fills; fall back gracefully if absent
+            if hasattr(self.info, 'user_fills'):
+                fills = await asyncio.to_thread(self.info.user_fills, self.wallet.address)
+            elif hasattr(self.info, 'fills'):
+                fills = await asyncio.to_thread(self.info.fills, self.wallet.address)
+            else:
+                return []
+            if isinstance(fills, list):
+                return fills[-limit:]
+            return []
+        except Exception as e:
+            logging.error(f"Get recent fills error: {e}")
+            return []
+
     def extract_oids(self, order_result):
         oids = []
         try:

@@ -15,6 +15,7 @@ import math  # For Sharpe
 from dotenv import load_dotenv
 import os
 import json
+from aiohttp import web
 
 load_dotenv()
 
@@ -94,7 +95,18 @@ def main():
                 account_info += f"{{'symbol': '{coin}', 'quantity': {pos.get('szi')}, 'entry_price': {pos.get('entryPx')}, 'current_price': {current_px}, 'liquidation_price': {liq_px}, 'unrealized_pnl': {pos.get('pnl',0)}, 'leverage': {pos.get('leverage', 1)}, ...}}\n"
             account_info += "\nActive Trades with Exit Plans:\n"
             for trade in active_trades:
-                account_info += f"Asset: {trade['asset']}, Long: {trade['is_long']}, Amount: {trade['amount']}, Entry: {trade['entry_price']}, TP OID: {trade['tp_oid']}, SL OID: {trade['sl_oid']}, Exit Plan: {trade['exit_plan']}\n"
+                opened_at_str = trade.get('opened_at')
+                minutes_open = 0.0
+                if opened_at_str:
+                    try:
+                        minutes_open = (datetime.now() - datetime.fromisoformat(opened_at_str)).total_seconds() / 60
+                    except Exception:
+                        minutes_open = 0.0
+                account_info += (
+                    f"Asset: {trade['asset']}, Long: {trade['is_long']}, Amount: {trade['amount']}, "
+                    f"Entry: {trade['entry_price']}, Opened: {opened_at_str}, MinutesOpen: {minutes_open:.1f}, "
+                    f"TP OID: {trade['tp_oid']}, SL OID: {trade['sl_oid']}, Exit Plan: {trade['exit_plan']}\n"
+                )
             
             # Include recent diary entries for context
             account_info += "\nRecent Trading History (last 10 decisions):\n"
@@ -126,6 +138,23 @@ def main():
             except Exception:
                 pass
 
+            # Include recent fills to reflect executed TP/SL
+            try:
+                fills = await hyperliquid.get_recent_fills(limit=50)
+                account_info += "\nRecent Fills (latest 20):\n"
+                for f in fills[-20:]:
+                    try:
+                        coin = f.get('coin') or f.get('asset')
+                        is_buy = f.get('isBuy')
+                        sz = f.get('sz') or f.get('size')
+                        px = f.get('px') or f.get('price')
+                        t = f.get('time') or f.get('timestamp')
+                        account_info += f"{t} {coin} {'BUY' if is_buy else 'SELL'} sz:{sz} px:{px}\n"
+                    except Exception:
+                        continue
+            except Exception:
+                pass
+
             # Check and close if exit conditions met
             for trade in active_trades[:]:
                 if await check_exit_condition(trade, taapi, hyperliquid):
@@ -142,7 +171,8 @@ def main():
                             "asset": trade['asset'],
                             "action": "close",
                             "reason": "exit_plan_triggered",
-                            "exit_plan": trade['exit_plan']
+                            "exit_plan": trade['exit_plan'],
+                            "opened_at": trade.get('opened_at')
                         }) + "\n")
 
             # Gather data for ALL assets first
@@ -218,15 +248,24 @@ def main():
 
             # Single LLM call with all assets
             context = (
+                f"## Invocation\n"
                 f"It has been {minutes_since_start:.0f} minutes since you started trading. "
                 f"The current time is {datetime.now()} and you've been invoked {invocation_count} times.\n\n"
-                f"CURRENT MARKET STATE FOR ALL COINS\n{all_market_data}\n"
-                f"HERE IS YOUR ACCOUNT INFORMATION & PERFORMANCE\n{account_info}\n\n"
-                f"Decide actions for ALL assets: {', '.join(args.assets)}. Output JSON array."
+                f"## Market Data\n{all_market_data}\n"
+                f"## Account Information & Performance\n{account_info}\n"
+                f"## Instructions\nDecide actions for ALL assets: {', '.join(args.assets)}. Output a STRICT JSON array only.\n"
             )
             add_event(f"Combined prompt length: {len(context)} chars for {len(args.assets)} assets")
             with open("prompts.log", "a") as f:
                 f.write(f"\n\n--- {datetime.now()} - ALL ASSETS ---\n{context}\n")
+
+            def _is_failed_outputs(outs):
+                if not outs:
+                    return True
+                try:
+                    return all(isinstance(o, dict) and (o.get('action') == 'hold') and ('parse error' in (o.get('rationale','').lower())) for o in outs)
+                except Exception:
+                    return True
 
             try:
                 outputs = agent.decide_trade_multi(args.assets, context)
@@ -238,6 +277,23 @@ def main():
                 add_event(f"Agent error: {e}")
                 add_event(f"Traceback: {traceback.format_exc()}")
                 outputs = []
+
+            # Retry once on failure/parse error with a stricter instruction prefix
+            if _is_failed_outputs(outputs):
+                add_event("Retrying LLM once due to invalid/parse-error output")
+                context_retry = (
+                    "## Retry Instruction\nReturn ONLY the JSON array per schema with no prose.\n\n" + context
+                )
+                try:
+                    outputs = agent.decide_trade_multi(args.assets, context_retry)
+                    if not isinstance(outputs, list):
+                        add_event(f"Retry invalid format: {outputs}")
+                        outputs = []
+                except Exception as e:
+                    import traceback
+                    add_event(f"Retry agent error: {e}")
+                    add_event(f"Retry traceback: {traceback.format_exc()}")
+                    outputs = []
 
             # Execute trades for each asset
             for output in outputs:
@@ -270,6 +326,13 @@ def main():
                             sl_oids = hyperliquid.extract_oids(sl_order)
                             sl_oid = sl_oids[0] if sl_oids else None
                             add_event(f"SL placed {asset} at {output['sl_price']}")
+                        # Reconcile: if opposite-side position exists or TP/SL just filled, clear stale active_trades for this asset
+                        for existing in active_trades[:]:
+                            if existing.get('asset') == asset:
+                                try:
+                                    active_trades.remove(existing)
+                                except ValueError:
+                                    pass
                         active_trades.append({
                             "asset": asset,
                             "is_long": is_buy,
@@ -277,7 +340,8 @@ def main():
                             "entry_price": current_price,
                             "tp_oid": tp_oid,
                             "sl_oid": sl_oid,
-                            "exit_plan": output["exit_plan"]
+                            "exit_plan": output["exit_plan"],
+                            "opened_at": datetime.now().isoformat()
                         })
                         add_event(f"{action.upper()} {asset} amount {amount:.4f} at ~{current_price}")
                         # Write to diary
@@ -295,7 +359,8 @@ def main():
                                 "sl_oid": sl_oid,
                                 "exit_plan": output.get("exit_plan", ""),
                                 "rationale": output.get("rationale", ""),
-                                "order_result": str(order)
+                                "order_result": str(order),
+                                "opened_at": datetime.now().isoformat()
                             }
                             f.write(json.dumps(diary_entry) + "\n")
                     else:
@@ -314,6 +379,45 @@ def main():
                     add_event(f"Execution error {asset}: {e}")
 
             await asyncio.sleep(get_interval_seconds(args.interval))
+
+    async def handle_diary(request):
+        try:
+            limit = int(request.query.get('limit', '200'))
+            with open(diary_path, "r") as f:
+                lines = f.readlines()
+            start = max(0, len(lines) - limit)
+            entries = [json.loads(l) for l in lines[start:]]
+            return web.json_response({"entries": entries})
+        except FileNotFoundError:
+            return web.json_response({"entries": []})
+        except Exception as e:
+            return web.json_response({"error": str(e)}, status=500)
+
+    async def handle_logs(request):
+        try:
+            path = request.query.get('path', 'llm_requests.log')
+            limit = int(request.query.get('limit', '2000'))
+            if not os.path.exists(path):
+                return web.Response(text="", content_type="text/plain")
+            with open(path, "r") as f:
+                data = f.read()
+            return web.Response(text=data[-limit:], content_type="text/plain")
+        except Exception as e:
+            return web.json_response({"error": str(e)}, status=500)
+
+    async def start_api(app):
+        app.router.add_get('/diary', handle_diary)
+        app.router.add_get('/logs', handle_logs)
+
+    async def main_async():
+        app = web.Application()
+        await start_api(app)
+        from src.config_loader import CONFIG as CFG
+        runner = web.AppRunner(app)
+        await runner.setup()
+        site = web.TCPSite(runner, CFG.get("api_host"), int(CFG.get("api_port")))
+        await site.start()
+        await run_loop()
 
     def calculate_total_return(state, trade_log):
         initial = 10000
@@ -348,7 +452,7 @@ def main():
             return False
         return False
 
-    asyncio.run(run_loop())
+    asyncio.run(main_async())
 
 
 if __name__ == "__main__":

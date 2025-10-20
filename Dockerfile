@@ -19,6 +19,10 @@ RUN pip install --no-cache-dir poetry && \
 # Copy source
 COPY src ./src
 
+# API defaults
+ENV APP_PORT=3000
+EXPOSE 3000
+
 # Default command: run as module to keep absolute imports working
 ENTRYPOINT ["poetry", "run", "python", "-m", "src.main"]
 

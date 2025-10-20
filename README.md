@@ -36,6 +36,22 @@ Populate `.env` (use `.env.example` as reference):
 ## Usage
 Run: `poetry run python src/main.py --assets BTC ETH --interval 1h`
 
+### Local API Endpoints
+When the agent runs, it also serves a minimal API:
+- `GET /diary?limit=200` — returns recent JSONL diary entries as JSON.
+- `GET /logs?path=llm_requests.log&limit=2000` — tails the specified log file.
+
+Configure bind host/port via env:
+- `API_HOST` (default `0.0.0.0`)
+- `API_PORT` or `APP_PORT` (default `3000`)
+
+Docker:
+```bash
+docker build --platform linux/amd64 -t trading-agent .
+docker run --rm -p 3000:3000 --env-file .env trading-agent
+# Now: curl http://localhost:3000/diary
+```
+
 ## Tool Calling
 The agent can dynamically fetch any TAAPI indicator (e.g., EMA, RSI) via tool calls. See [TAAPI Indicators](https://taapi.io/indicators/) and [EMA Example](https://taapi.io/indicators/exponential-moving-average/) for details.
 
