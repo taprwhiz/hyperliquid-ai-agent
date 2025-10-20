@@ -1,4 +1,4 @@
-# LLM-based Trading Agent on Hyperliquid
+# Nocture: AI Trading Agent on Hyperliquid
 
 This project implements an AI-powered trading agent that leverages LLM models (via OpenRouter) to analyze real-time market data from TAAPI and CoinAPI, make informed trading decisions, and execute trades on the Hyperliquid decentralized exchange. The agent runs in a continuous loop, monitoring specified cryptocurrency assets at configurable intervals, using technical indicators to decide on buy/sell/hold actions, and manages positions with take-profit and stop-loss orders.
 
