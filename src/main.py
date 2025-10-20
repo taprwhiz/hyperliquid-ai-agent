@@ -4,18 +4,18 @@ import pathlib
 sys.path.append(str(pathlib.Path(__file__).parent.parent))
 from src.agent.decision_maker import TradingAgent
 from src.indicators.taapi_client import TAAPIClient
-from src.indicators.coinapi_client import CoinAPIClient
 from src.trading.hyperliquid_api import HyperliquidAPI
 import time
 import asyncio
 import logging
 from collections import deque
-from datetime import datetime
+from datetime import datetime, timezone
 import math  # For Sharpe
 from dotenv import load_dotenv
 import os
 import json
 from aiohttp import web
+from src.utils.formatting import format_number as fmt, format_size as fmt_sz
 
 load_dotenv()
 
@@ -58,17 +58,19 @@ def main():
         parser.error("Please provide --assets and --interval, or set ASSETS and INTERVAL in .env")
 
     taapi = TAAPIClient()
-    coinapi = CoinAPIClient()
     hyperliquid = HyperliquidAPI()
     agent = TradingAgent()
 
 
-    start_time = datetime.now()
+    start_time = datetime.now(timezone.utc)
     invocation_count = 0
     trade_log = []  # For Sharpe: list of returns
     active_trades = []  # {'asset','is_long','amount','entry_price','tp_oid','sl_oid','exit_plan'}
     recent_events = deque(maxlen=200)
     diary_path = "diary.jsonl"
+    initial_account_value = None
+    # Perp mid-price history sampled each loop (authoritative, avoids spot/perp basis mismatch)
+    price_history = {}
 
     print(f"Starting trading agent for assets: {args.assets} at interval: {args.interval}")
 
@@ -79,20 +81,28 @@ def main():
         nonlocal invocation_count
         while True:
             invocation_count += 1
-            minutes_since_start = (datetime.now() - start_time).total_seconds() / 60
+            minutes_since_start = (datetime.now(timezone.utc) - start_time).total_seconds() / 60
+
+            # number formatting helpers imported from src.utils.formatting
 
             # Global account state
             state = await hyperliquid.get_user_state()
-            total_return = calculate_total_return(state, trade_log)
             sharpe = calculate_sharpe(trade_log)
 
             # Format account info like example
-            account_info = f"Current Total Return (percent): {total_return:.2f}%\nAvailable Cash: {state['balance']}\nCurrent Account Value: {state['balance'] + sum(p.get('pnl', 0) for p in state['positions'])}\nSharpe Ratio: {sharpe:.3f}\nCurrent live positions & performance:\n"
+            account_value = state['balance'] + sum(p.get('pnl', 0) for p in state['positions'])
+            if initial_account_value is None:
+                initial_account_value = account_value
+            total_return = ((account_value - initial_account_value) / initial_account_value * 100.0) if initial_account_value else 0.0
+            account_info = f"Current Total Return (percent): {total_return:.2f}%\nAvailable Cash: {fmt(state['balance'], 2)}\nCurrent Account Value: {fmt(account_value, 2)}\nSharpe Ratio: {sharpe:.3f}\nCurrent live positions & performance:\n"
             for pos in state['positions']:
                 coin = pos.get('coin')
                 current_px = round(await hyperliquid.get_current_price(coin), 2) if coin else 0
-                liq_px = pos.get('liquidationPx') or pos.get('liqPx', 0)
-                account_info += f"{{'symbol': '{coin}', 'quantity': {pos.get('szi')}, 'entry_price': {pos.get('entryPx')}, 'current_price': {current_px}, 'liquidation_price': {liq_px}, 'unrealized_pnl': {pos.get('pnl',0)}, 'leverage': {pos.get('leverage', 1)}, ...}}\n"
+                liq_px = fmt(pos.get('liquidationPx') or pos.get('liqPx', 0), 2)
+                qty_disp = fmt_sz(pos.get('szi'))
+                entry_disp = fmt(pos.get('entryPx'), 2)
+                pnl_disp = fmt(pos.get('pnl', 0), 4)
+                account_info += f"{{'symbol': '{coin}', 'quantity': {qty_disp}, 'entry_price': {entry_disp}, 'current_price': {current_px}, 'liquidation_price': {liq_px}, 'unrealized_pnl': {pnl_disp}, 'leverage': {pos.get('leverage', 1)}, ...}}\n"
             account_info += "\nActive Trades with Exit Plans:\n"
             for trade in active_trades:
                 opened_at_str = trade.get('opened_at')
@@ -102,9 +112,11 @@ def main():
                         minutes_open = (datetime.now() - datetime.fromisoformat(opened_at_str)).total_seconds() / 60
                     except Exception:
                         minutes_open = 0.0
+                amt_disp = fmt_sz(trade['amount'])
+                entry_trade_disp = fmt(trade['entry_price'], 2)
                 account_info += (
-                    f"Asset: {trade['asset']}, Long: {trade['is_long']}, Amount: {trade['amount']}, "
-                    f"Entry: {trade['entry_price']}, Opened: {opened_at_str}, MinutesOpen: {minutes_open:.1f}, "
+                    f"Asset: {trade['asset']}, Long: {trade['is_long']}, Amount: {amt_disp}, "
+                    f"Entry: {entry_trade_disp}, Opened: {opened_at_str}, MinutesOpen: {minutes_open:.1f}, "
                     f"TP OID: {trade['tp_oid']}, SL OID: {trade['sl_oid']}, Exit Plan: {trade['exit_plan']}\n"
                 )
             
@@ -127,14 +139,45 @@ def main():
                     coin = o.get('coin')
                     oid = o.get('oid')
                     side = o.get('isBuy')
-                    sz = o.get('sz')
-                    px = o.get('px')
+                    sz = fmt_sz(o.get('sz'))
+                    raw_px = o.get('px')
+                    px = fmt(raw_px, 2) if raw_px not in (None, "None") else None
+                    trig_px = o.get('triggerPx')
                     order_type_obj = o.get('orderType')
                     if isinstance(order_type_obj, dict) and len(order_type_obj.keys()) > 0:
                         order_type = list(order_type_obj.keys())[0]
                     else:
                         order_type = str(order_type_obj)
-                    account_info += f"oid:{oid} {coin} {'BUY' if side else 'SELL'} sz:{sz} px:{px} type:{order_type}\n"
+                    if trig_px is not None and px is None:
+                        account_info += f"oid:{oid} {coin} {'BUY' if side else 'SELL'} sz:{sz} triggerPx:{fmt(trig_px,2)} type:{order_type}\n"
+                    else:
+                        account_info += f"oid:{oid} {coin} {'BUY' if side else 'SELL'} sz:{sz} px:{px} type:{order_type}\n"
+            except Exception:
+                pass
+
+            # Reconcile active_trades with authoritative exchange state (positions + open orders)
+            try:
+                assets_with_positions = set()
+                for pos in state['positions']:
+                    try:
+                        if abs(float(pos.get('szi') or 0)) > 0:
+                            assets_with_positions.add(pos.get('coin'))
+                    except Exception:
+                        continue
+                assets_with_orders = set([o.get('coin') for o in (open_orders or []) if o.get('coin')])
+                for tr in active_trades[:]:
+                    asset = tr.get('asset')
+                    if asset not in assets_with_positions and asset not in assets_with_orders:
+                        add_event(f"Reconciling stale active trade for {asset} (no position, no orders)")
+                        active_trades.remove(tr)
+                        with open(diary_path, "a") as f:
+                            f.write(json.dumps({
+                                "timestamp": datetime.now(timezone.utc).isoformat(),
+                                "asset": asset,
+                                "action": "reconcile_close",
+                                "reason": "no_position_no_orders",
+                                "opened_at": tr.get('opened_at')
+                            }) + "\n")
             except Exception:
                 pass
 
@@ -146,10 +189,19 @@ def main():
                     try:
                         coin = f.get('coin') or f.get('asset')
                         is_buy = f.get('isBuy')
-                        sz = f.get('sz') or f.get('size')
-                        px = f.get('px') or f.get('price')
-                        t = f.get('time') or f.get('timestamp')
-                        account_info += f"{t} {coin} {'BUY' if is_buy else 'SELL'} sz:{sz} px:{px}\n"
+                        sz = fmt_sz(f.get('sz') or f.get('size'))
+                        px = fmt(f.get('px') or f.get('price'), 2)
+                t_raw = f.get('time') or f.get('timestamp')
+                try:
+                    # convert ms or s to ISO
+                    t_int = int(t_raw)
+                    if t_int > 1e12:
+                        t_iso = datetime.fromtimestamp(t_int / 1000, tz=timezone.utc).isoformat()
+                    else:
+                        t_iso = datetime.fromtimestamp(t_int, tz=timezone.utc).isoformat()
+                except Exception:
+                    t_iso = str(t_raw)
+                account_info += f"{t_iso} {coin} {'BUY' if is_buy else 'SELL'} sz:{sz} px:{px}\n"
                     except Exception:
                         continue
             except Exception:
@@ -182,18 +234,16 @@ def main():
                 try:
                     # Gather data like example
                     current_price = round(await hyperliquid.get_current_price(asset), 2)
+                    # Update perp mid-price history (sampled per loop)
+                    if asset not in price_history:
+                        price_history[asset] = deque(maxlen=60)
+                    price_history[asset].append({"t": datetime.now(timezone.utc).isoformat(), "mid": fmt(current_price, 2)})
                     oi = await hyperliquid.get_open_interest(asset)
                     funding = await hyperliquid.get_funding_rate(asset)
 
-                    # Initial indicators + historical (intraday)
+                    # Initial indicators (intraday) from TAAPI only; avoid spot/perp basis mismatch
                     indicators = taapi.get_indicators(asset, args.interval)
-                    symbol_id = f"BINANCE_SPOT_{asset}_USDT"
-                    try:
-                        ohlcv = coinapi.ohlcv_latest(symbol_id, period_id="5MIN", limit=10)
-                        hist_prices = [{"value": (c["price_open"] + c["price_close"]) / 2} for c in ohlcv]
-                    except Exception as e:
-                        add_event(f"CoinAPI error for {asset}: {e}")
-                        hist_prices = []
+                    hist_prices = []
 
                     intraday_tf = "5m"
                     ema_series = taapi.fetch_series("ema", f"{asset}/USDT", intraday_tf, results=10, params={"period": 20}, value_key="value")
@@ -203,6 +253,10 @@ def main():
                     cur_rsi7 = round(rsi7_series[-1], 2) if rsi7_series else "N/A"
                     cur_ema20 = round(ema_series[-1], 2) if ema_series else "N/A"
                     cur_macd = round(macd_series[-1], 2) if macd_series else "N/A"
+                    ema_series_r = [fmt(v, 2) for v in ema_series] if ema_series else []
+                    macd_series_r = [fmt(v, 2) for v in macd_series] if macd_series else []
+                    rsi7_series_r = [fmt(v, 2) for v in rsi7_series] if rsi7_series else []
+                    rsi14_series_r = [fmt(v, 2) for v in rsi14_series] if rsi14_series else []
 
                     # Long-term (4h)
                     lt_ema20 = taapi.fetch_value("ema", f"{asset}/USDT", "4h", params={"period": 20}, key="value")
@@ -213,31 +267,24 @@ def main():
                     lt_atr3 = round(lt_atr3, 2) if lt_atr3 is not None else "N/A"
                     lt_atr14 = taapi.fetch_value("atr", f"{asset}/USDT", "4h", params={"period": 14}, key="value")
                     lt_atr14 = round(lt_atr14, 2) if lt_atr14 is not None else "N/A"
-                    # Use CoinAPI for real volume (TAAPI returns deltas)
-                    try:
-                        ohlcv_4h = coinapi.ohlcv_latest(symbol_id, period_id="4HRS", limit=10)
-                        vol_series = [c["volume_traded"] for c in ohlcv_4h]
-                        lt_volume = round(vol_series[-1], 2) if vol_series else 0
-                        avg_volume = round((sum(vol_series) / len(vol_series)), 2) if vol_series else 0
-                    except Exception as e:
-                        add_event(f"Volume fetch error for {asset}: {e}")
-                        lt_volume = 0
-                        avg_volume = 0
                     lt_macd_series = taapi.fetch_series("macd", f"{asset}/USDT", "4h", results=10, value_key="valueMACD")
                     lt_rsi_series = taapi.fetch_series("rsi", f"{asset}/USDT", "4h", results=10, params={"period": 14}, value_key="value")
+                    lt_macd_series_r = [fmt(v, 2) for v in lt_macd_series] if lt_macd_series else []
+                    lt_rsi_series_r = [fmt(v, 2) for v in lt_rsi_series] if lt_rsi_series else []
 
                     # Format like example
                     # Compute annualized funding (paid hourly: × 24 × 365)
                     funding_annualized = round(funding * 24 * 365 * 100, 2) if funding else None
                     market_data = f"ALL {asset.upper()} DATA\ncurrent_price = {current_price}, current_ema20 = {cur_ema20}, current_macd = {cur_macd}, current_rsi (7 period) = {cur_rsi7}\n"
                     market_data += f"Open Interest: {oi}\nFunding Rate: {funding} (Annualized: {funding_annualized}%)\n"
-                    market_data += "Intraday series (5-minute intervals, oldest → latest):\n"
-                    market_data += f"Mid prices: {json.dumps([p['value'] for p in hist_prices])}\n"
-                    market_data += f"EMA indicators (20-period): {json.dumps(ema_series)}\n"
-                    market_data += f"MACD indicators: {json.dumps(macd_series)}\n"
-                    market_data += f"RSI indicators (7-Period): {json.dumps(rsi7_series)}\n"
-                    market_data += f"RSI indicators (14-Period): {json.dumps(rsi14_series)}\n"
-                    market_data += f"Longer-term context (4-hour timeframe):\n20-Period EMA: {lt_ema20} vs. 50-Period EMA: {lt_ema50}\n3-Period ATR: {lt_atr3} vs. {lt_atr14}\nCurrent Volume: {lt_volume} vs. Average Volume: {avg_volume}\nMACD indicators: {json.dumps(lt_macd_series)}\nRSI indicators (14-Period): {json.dumps(lt_rsi_series)}\n\n"
+                    # Perp mid prices sampled per interval (authoritative, concise)
+                    recent_mids = [p["mid"] for p in list(price_history.get(asset, []))[-10:]]
+                    market_data += f"Perp mid prices (sampled): {json.dumps(recent_mids)}\n"
+                    market_data += f"EMA indicators (20-period): {json.dumps(ema_series_r)}\n"
+                    market_data += f"MACD indicators: {json.dumps(macd_series_r)}\n"
+                    market_data += f"RSI indicators (7-Period): {json.dumps(rsi7_series_r)}\n"
+                    market_data += f"RSI indicators (14-Period): {json.dumps(rsi14_series_r)}\n"
+                    market_data += f"Longer-term context (4-hour timeframe):\n20-Period EMA: {lt_ema20} vs. 50-Period EMA: {lt_ema50}\n3-Period ATR: {lt_atr3} vs. {lt_atr14}\nMACD indicators: {json.dumps(lt_macd_series_r)}\nRSI indicators (14-Period): {json.dumps(lt_rsi_series_r)}\n\n"
 
                     all_market_data += market_data
                     asset_prices[asset] = current_price
@@ -250,7 +297,7 @@ def main():
             context = (
                 f"## Invocation\n"
                 f"It has been {minutes_since_start:.0f} minutes since you started trading. "
-                f"The current time is {datetime.now()} and you've been invoked {invocation_count} times.\n\n"
+                f"The current time is {datetime.now(timezone.utc).isoformat()} and you've been invoked {invocation_count} times.\n\n"
                 f"## Market Data\n{all_market_data}\n"
                 f"## Account Information & Performance\n{account_info}\n"
                 f"## Instructions\nDecide actions for ALL assets: {', '.join(args.assets)}. Output a STRICT JSON array only.\n"
@@ -313,7 +360,18 @@ def main():
                         amount = alloc_usd / current_price
 
                         order = await hyperliquid.place_buy_order(asset, amount) if is_buy else await hyperliquid.place_sell_order(asset, amount)
-                        trade_log.append({"type": action, "price": current_price, "amount": amount, "exit_plan": output["exit_plan"]})
+                        # Confirm by checking recent fills for this asset shortly after placing
+                        await asyncio.sleep(1)
+                        fills_check = await hyperliquid.get_recent_fills(limit=10)
+                        filled = False
+                        for fc in reversed(fills_check):
+                            try:
+                                if (fc.get('coin') == asset or fc.get('asset') == asset):
+                                    filled = True
+                                    break
+                            except Exception:
+                                continue
+                        trade_log.append({"type": action, "price": current_price, "amount": amount, "exit_plan": output["exit_plan"], "filled": filled})
                         tp_oid = None
                         sl_oid = None
                         if output["tp_price"]:
@@ -344,10 +402,10 @@ def main():
                             "opened_at": datetime.now().isoformat()
                         })
                         add_event(f"{action.upper()} {asset} amount {amount:.4f} at ~{current_price}")
-                        # Write to diary
+                        # Write to diary after confirming fills status
                         with open(diary_path, "a") as f:
                             diary_entry = {
-                                "timestamp": datetime.now().isoformat(),
+                                "timestamp": datetime.now(timezone.utc).isoformat(),
                                 "asset": asset,
                                 "action": action,
                                 "allocation_usd": alloc_usd,
@@ -360,7 +418,8 @@ def main():
                                 "exit_plan": output.get("exit_plan", ""),
                                 "rationale": output.get("rationale", ""),
                                 "order_result": str(order),
-                                "opened_at": datetime.now().isoformat()
+                                "opened_at": datetime.now(timezone.utc).isoformat(),
+                                "filled": filled
                             }
                             f.write(json.dumps(diary_entry) + "\n")
                     else:
@@ -382,6 +441,17 @@ def main():
 
     async def handle_diary(request):
         try:
+            raw = request.query.get('raw')
+            download = request.query.get('download')
+            if raw or download:
+                if not os.path.exists(diary_path):
+                    return web.Response(text="", content_type="text/plain")
+                with open(diary_path, "r") as f:
+                    data = f.read()
+                headers = {}
+                if download:
+                    headers["Content-Disposition"] = f"attachment; filename=diary.jsonl"
+                return web.Response(text=data, content_type="text/plain", headers=headers)
             limit = int(request.query.get('limit', '200'))
             with open(diary_path, "r") as f:
                 lines = f.readlines()
@@ -396,11 +466,18 @@ def main():
     async def handle_logs(request):
         try:
             path = request.query.get('path', 'llm_requests.log')
-            limit = int(request.query.get('limit', '2000'))
+            download = request.query.get('download')
+            limit_param = request.query.get('limit')
             if not os.path.exists(path):
                 return web.Response(text="", content_type="text/plain")
             with open(path, "r") as f:
                 data = f.read()
+            if download or (limit_param and (limit_param.lower() == 'all' or limit_param == '-1')):
+                headers = {}
+                if download:
+                    headers["Content-Disposition"] = f"attachment; filename={os.path.basename(path)}"
+                return web.Response(text=data, content_type="text/plain", headers=headers)
+            limit = int(limit_param) if limit_param else 2000
             return web.Response(text=data[-limit:], content_type="text/plain")
         except Exception as e:
             return web.json_response({"error": str(e)}, status=500)

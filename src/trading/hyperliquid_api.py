@@ -72,7 +72,18 @@ class HyperliquidAPI:
     async def get_open_orders(self):
         """Return list of current open orders for this wallet."""
         try:
-            return await asyncio.to_thread(self.info.frontend_open_orders, self.wallet.address)
+            orders = await asyncio.to_thread(self.info.frontend_open_orders, self.wallet.address)
+            # Normalize trigger price if present in orderType
+            for o in orders:
+                try:
+                    ot = o.get("orderType")
+                    if isinstance(ot, dict) and "trigger" in ot:
+                        trig = ot.get("trigger") or {}
+                        if "triggerPx" in trig:
+                            o["triggerPx"] = float(trig["triggerPx"])
+                except Exception:
+                    continue
+            return orders
         except Exception as e:
             logging.error(f"Get open orders error: {e}")
             return []

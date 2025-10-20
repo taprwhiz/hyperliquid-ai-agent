@@ -24,7 +24,6 @@ Populate `.env` (use `.env.example` as reference):
 - OPENROUTER_API_KEY
 - LLM_MODEL 
 - Optional: OPENROUTER_BASE_URL (`https://openrouter.ai/api/v1`), OPENROUTER_REFERER, OPENROUTER_APP_TITLE
-- COINAPI_KEY 
 
 ### Obtaining API Keys
 - **TAAPI_API_KEY**: Sign up at [TAAPI.io](https://taapi.io/) and generate an API key from your dashboard.

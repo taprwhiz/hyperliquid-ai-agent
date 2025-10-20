@@ -19,8 +19,6 @@ CONFIG = {
     "openrouter_referer": _get_env("OPENROUTER_REFERER"),
     "openrouter_app_title": _get_env("OPENROUTER_APP_TITLE", "trading-agent"),
     "llm_model": _get_env("LLM_MODEL", "x-ai/grok-4"),
-    # CoinAPI
-    "coinapi_key": _get_env("COINAPI_KEY"),
     # Runtime controls via env
     "assets": _get_env("ASSETS"),  # e.g., "BTC ETH SOL" or "BTC,ETH,SOL"
     "interval": _get_env("INTERVAL"),  # e.g., "5m", "1h"
