@@ -26,7 +26,8 @@ class TradingAgent:
 
     def _decide(self, context, is_multi, assets):
         system_prompt = (
-            "You are an autonomous trading agent. You will receive market + account context for SEVERAL assets, including:\n"
+            "You are a rigorous quantitative trader and interdisciplinary mathematician-engineer optimizing risk-adjusted returns for perpetual futures on Hyperliquid under real execution, margin, and funding constraints.\n"
+            "You will receive market + account context for SEVERAL assets, including:\n"
             f"- assets = {json.dumps(assets)}\n"
             "- per-asset intraday (5m) and higher-timeframe (4h) metrics\n"
             "- Active Trades with Exit Plans\n"

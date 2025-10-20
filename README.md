@@ -59,7 +59,7 @@ The agent can dynamically fetch any TAAPI indicator (e.g., EMA, RSI) via tool ca
 EigenCloud (via EigenX CLI) allows deploying this trading agent in a Trusted Execution Environment (TEE) with secure key management.
 
 ### Prerequisites
-- Allowlisted Ethereum account (Sepolia for testnet). Request onboarding at [Eigencloud Onboarding](https://onboarding.eigencloud.xyz).
+- Allowlisted Ethereum account (Sepolia for testnet). Request onboarding at [EigenCloud Onboarding](https://onboarding.eigencloud.xyz).
 - Docker installed.
 - Sepolia ETH for deployments.
 

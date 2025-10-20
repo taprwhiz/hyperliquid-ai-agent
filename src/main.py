@@ -78,7 +78,7 @@ def main():
         logging.info(msg)
 
     async def run_loop():
-        nonlocal invocation_count
+        nonlocal invocation_count, initial_account_value
         while True:
             invocation_count += 1
             minutes_since_start = (datetime.now(timezone.utc) - start_time).total_seconds() / 60
@@ -191,17 +191,17 @@ def main():
                         is_buy = f.get('isBuy')
                         sz = fmt_sz(f.get('sz') or f.get('size'))
                         px = fmt(f.get('px') or f.get('price'), 2)
-                t_raw = f.get('time') or f.get('timestamp')
-                try:
-                    # convert ms or s to ISO
-                    t_int = int(t_raw)
-                    if t_int > 1e12:
-                        t_iso = datetime.fromtimestamp(t_int / 1000, tz=timezone.utc).isoformat()
-                    else:
-                        t_iso = datetime.fromtimestamp(t_int, tz=timezone.utc).isoformat()
-                except Exception:
-                    t_iso = str(t_raw)
-                account_info += f"{t_iso} {coin} {'BUY' if is_buy else 'SELL'} sz:{sz} px:{px}\n"
+                        t_raw = f.get('time') or f.get('timestamp')
+                        try:
+                            # convert ms or s to ISO
+                            t_int = int(t_raw)
+                            if t_int > 1e12:
+                                t_iso = datetime.fromtimestamp(t_int / 1000, tz=timezone.utc).isoformat()
+                            else:
+                                t_iso = datetime.fromtimestamp(t_int, tz=timezone.utc).isoformat()
+                        except Exception:
+                            t_iso = str(t_raw)
+                        account_info += f"{t_iso} {coin} {'BUY' if is_buy else 'SELL'} sz:{sz} px:{px}\n"
                     except Exception:
                         continue
             except Exception:
