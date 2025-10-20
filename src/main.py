@@ -1,0 +1,355 @@
+import sys
+import argparse
+import pathlib
+sys.path.append(str(pathlib.Path(__file__).parent.parent))
+from src.agent.decision_maker import TradingAgent
+from src.indicators.taapi_client import TAAPIClient
+from src.indicators.coinapi_client import CoinAPIClient
+from src.trading.hyperliquid_api import HyperliquidAPI
+import time
+import asyncio
+import logging
+from collections import deque
+from datetime import datetime
+import math  # For Sharpe
+from dotenv import load_dotenv
+import os
+import json
+
+load_dotenv()
+
+logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
+
+def clear_terminal():
+    os.system('cls' if os.name == 'nt' else 'clear')
+
+def get_interval_seconds(interval_str):
+    if interval_str.endswith('m'):
+        return int(interval_str[:-1]) * 60
+    elif interval_str.endswith('h'):
+        return int(interval_str[:-1]) * 3600
+    elif interval_str.endswith('d'):
+        return int(interval_str[:-1]) * 86400
+    else:
+        raise ValueError(f"Unsupported interval: {interval_str}")
+
+def main():
+    clear_terminal()
+    parser = argparse.ArgumentParser(description="LLM-based Trading Agent on Hyperliquid")
+    parser.add_argument("--assets", type=str, nargs="+", required=False, help="Assets to trade, e.g., BTC ETH")
+    parser.add_argument("--interval", type=str, required=False, help="Interval period, e.g., 1h")
+    args = parser.parse_args()
+
+    # Allow assets/interval via .env (CONFIG) if CLI not provided
+    from src.config_loader import CONFIG
+    assets_env = CONFIG.get("assets")
+    interval_env = CONFIG.get("interval")
+    if (not args.assets or len(args.assets) == 0) and assets_env:
+        # Support space or comma separated
+        if "," in assets_env:
+            args.assets = [a.strip() for a in assets_env.split(",") if a.strip()]
+        else:
+            args.assets = [a.strip() for a in assets_env.split(" ") if a.strip()]
+    if not args.interval and interval_env:
+        args.interval = interval_env
+
+    if not args.assets or not args.interval:
+        parser.error("Please provide --assets and --interval, or set ASSETS and INTERVAL in .env")
+
+    taapi = TAAPIClient()
+    coinapi = CoinAPIClient()
+    hyperliquid = HyperliquidAPI()
+    agent = TradingAgent()
+
+
+    start_time = datetime.now()
+    invocation_count = 0
+    trade_log = []  # For Sharpe: list of returns
+    active_trades = []  # {'asset','is_long','amount','entry_price','tp_oid','sl_oid','exit_plan'}
+    recent_events = deque(maxlen=200)
+    diary_path = "diary.jsonl"
+
+    print(f"Starting trading agent for assets: {args.assets} at interval: {args.interval}")
+
+    def add_event(msg: str):
+        logging.info(msg)
+
+    async def run_loop():
+        nonlocal invocation_count
+        while True:
+            invocation_count += 1
+            minutes_since_start = (datetime.now() - start_time).total_seconds() / 60
+
+            # Global account state
+            state = await hyperliquid.get_user_state()
+            total_return = calculate_total_return(state, trade_log)
+            sharpe = calculate_sharpe(trade_log)
+
+            # Format account info like example
+            account_info = f"Current Total Return (percent): {total_return:.2f}%\nAvailable Cash: {state['balance']}\nCurrent Account Value: {state['balance'] + sum(p.get('pnl', 0) for p in state['positions'])}\nSharpe Ratio: {sharpe:.3f}\nCurrent live positions & performance:\n"
+            for pos in state['positions']:
+                coin = pos.get('coin')
+                current_px = round(await hyperliquid.get_current_price(coin), 2) if coin else 0
+                liq_px = pos.get('liquidationPx') or pos.get('liqPx', 0)
+                account_info += f"{{'symbol': '{coin}', 'quantity': {pos.get('szi')}, 'entry_price': {pos.get('entryPx')}, 'current_price': {current_px}, 'liquidation_price': {liq_px}, 'unrealized_pnl': {pos.get('pnl',0)}, 'leverage': {pos.get('leverage', 1)}, ...}}\n"
+            account_info += "\nActive Trades with Exit Plans:\n"
+            for trade in active_trades:
+                account_info += f"Asset: {trade['asset']}, Long: {trade['is_long']}, Amount: {trade['amount']}, Entry: {trade['entry_price']}, TP OID: {trade['tp_oid']}, SL OID: {trade['sl_oid']}, Exit Plan: {trade['exit_plan']}\n"
+            
+            # Include recent diary entries for context
+            account_info += "\nRecent Trading History (last 10 decisions):\n"
+            try:
+                with open(diary_path, "r") as f:
+                    lines = f.readlines()
+                    for line in lines[-10:]:
+                        entry = json.loads(line)
+                        account_info += f"{entry.get('timestamp', '')} - {entry.get('asset', '')}: {entry.get('action', '')} - {entry.get('rationale', '')[:80]}\n"
+            except Exception:
+                pass
+
+            # Include active open orders context (TP/SL or any resting orders)
+            try:
+                open_orders = await hyperliquid.get_open_orders()
+                account_info += "\nActive Open Orders:\n"
+                for o in open_orders[:50]:  # cap to 50 for prompt size
+                    coin = o.get('coin')
+                    oid = o.get('oid')
+                    side = o.get('isBuy')
+                    sz = o.get('sz')
+                    px = o.get('px')
+                    order_type_obj = o.get('orderType')
+                    if isinstance(order_type_obj, dict) and len(order_type_obj.keys()) > 0:
+                        order_type = list(order_type_obj.keys())[0]
+                    else:
+                        order_type = str(order_type_obj)
+                    account_info += f"oid:{oid} {coin} {'BUY' if side else 'SELL'} sz:{sz} px:{px} type:{order_type}\n"
+            except Exception:
+                pass
+
+            # Check and close if exit conditions met
+            for trade in active_trades[:]:
+                if await check_exit_condition(trade, taapi, hyperliquid):
+                    close_order = await hyperliquid.place_sell_order(trade['asset'], trade['amount']) if trade['is_long'] else await hyperliquid.place_buy_order(trade['asset'], trade['amount'])
+                    add_event(f"Closed {trade['asset']} due to exit plan: {trade['exit_plan']}")
+                    # Cancel all remaining orders for this asset (TP/SL and any orphans)
+                    cancel_result = await hyperliquid.cancel_all_orders(trade['asset'])
+                    add_event(f"Cancelled {cancel_result.get('cancelled_count', 0)} orders for {trade['asset']}")
+                    active_trades.remove(trade)
+                    # Log to diary
+                    with open(diary_path, "a") as f:
+                        f.write(json.dumps({
+                            "timestamp": datetime.now().isoformat(),
+                            "asset": trade['asset'],
+                            "action": "close",
+                            "reason": "exit_plan_triggered",
+                            "exit_plan": trade['exit_plan']
+                        }) + "\n")
+
+            # Gather data for ALL assets first
+            all_market_data = ""
+            asset_prices = {}
+            for asset in args.assets:
+                try:
+                    # Gather data like example
+                    current_price = round(await hyperliquid.get_current_price(asset), 2)
+                    oi = await hyperliquid.get_open_interest(asset)
+                    funding = await hyperliquid.get_funding_rate(asset)
+
+                    # Initial indicators + historical (intraday)
+                    indicators = taapi.get_indicators(asset, args.interval)
+                    symbol_id = f"BINANCE_SPOT_{asset}_USDT"
+                    try:
+                        ohlcv = coinapi.ohlcv_latest(symbol_id, period_id="5MIN", limit=10)
+                        hist_prices = [{"value": (c["price_open"] + c["price_close"]) / 2} for c in ohlcv]
+                    except Exception as e:
+                        add_event(f"CoinAPI error for {asset}: {e}")
+                        hist_prices = []
+
+                    intraday_tf = "5m"
+                    ema_series = taapi.fetch_series("ema", f"{asset}/USDT", intraday_tf, results=10, params={"period": 20}, value_key="value")
+                    macd_series = taapi.fetch_series("macd", f"{asset}/USDT", intraday_tf, results=10, value_key="valueMACD")
+                    rsi7_series = taapi.fetch_series("rsi", f"{asset}/USDT", intraday_tf, results=10, params={"period": 7}, value_key="value")
+                    rsi14_series = taapi.fetch_series("rsi", f"{asset}/USDT", intraday_tf, results=10, params={"period": 14}, value_key="value")
+                    cur_rsi7 = round(rsi7_series[-1], 2) if rsi7_series else "N/A"
+                    cur_ema20 = round(ema_series[-1], 2) if ema_series else "N/A"
+                    cur_macd = round(macd_series[-1], 2) if macd_series else "N/A"
+
+                    # Long-term (4h)
+                    lt_ema20 = taapi.fetch_value("ema", f"{asset}/USDT", "4h", params={"period": 20}, key="value")
+                    lt_ema20 = round(lt_ema20, 2) if lt_ema20 is not None else "N/A"
+                    lt_ema50 = taapi.fetch_value("ema", f"{asset}/USDT", "4h", params={"period": 50}, key="value")
+                    lt_ema50 = round(lt_ema50, 2) if lt_ema50 is not None else "N/A"
+                    lt_atr3 = taapi.fetch_value("atr", f"{asset}/USDT", "4h", params={"period": 3}, key="value")
+                    lt_atr3 = round(lt_atr3, 2) if lt_atr3 is not None else "N/A"
+                    lt_atr14 = taapi.fetch_value("atr", f"{asset}/USDT", "4h", params={"period": 14}, key="value")
+                    lt_atr14 = round(lt_atr14, 2) if lt_atr14 is not None else "N/A"
+                    # Use CoinAPI for real volume (TAAPI returns deltas)
+                    try:
+                        ohlcv_4h = coinapi.ohlcv_latest(symbol_id, period_id="4HRS", limit=10)
+                        vol_series = [c["volume_traded"] for c in ohlcv_4h]
+                        lt_volume = round(vol_series[-1], 2) if vol_series else 0
+                        avg_volume = round((sum(vol_series) / len(vol_series)), 2) if vol_series else 0
+                    except Exception as e:
+                        add_event(f"Volume fetch error for {asset}: {e}")
+                        lt_volume = 0
+                        avg_volume = 0
+                    lt_macd_series = taapi.fetch_series("macd", f"{asset}/USDT", "4h", results=10, value_key="valueMACD")
+                    lt_rsi_series = taapi.fetch_series("rsi", f"{asset}/USDT", "4h", results=10, params={"period": 14}, value_key="value")
+
+                    # Format like example
+                    # Compute annualized funding (paid hourly: × 24 × 365)
+                    funding_annualized = round(funding * 24 * 365 * 100, 2) if funding else None
+                    market_data = f"ALL {asset.upper()} DATA\ncurrent_price = {current_price}, current_ema20 = {cur_ema20}, current_macd = {cur_macd}, current_rsi (7 period) = {cur_rsi7}\n"
+                    market_data += f"Open Interest: {oi}\nFunding Rate: {funding} (Annualized: {funding_annualized}%)\n"
+                    market_data += "Intraday series (5-minute intervals, oldest → latest):\n"
+                    market_data += f"Mid prices: {json.dumps([p['value'] for p in hist_prices])}\n"
+                    market_data += f"EMA indicators (20-period): {json.dumps(ema_series)}\n"
+                    market_data += f"MACD indicators: {json.dumps(macd_series)}\n"
+                    market_data += f"RSI indicators (7-Period): {json.dumps(rsi7_series)}\n"
+                    market_data += f"RSI indicators (14-Period): {json.dumps(rsi14_series)}\n"
+                    market_data += f"Longer-term context (4-hour timeframe):\n20-Period EMA: {lt_ema20} vs. 50-Period EMA: {lt_ema50}\n3-Period ATR: {lt_atr3} vs. {lt_atr14}\nCurrent Volume: {lt_volume} vs. Average Volume: {avg_volume}\nMACD indicators: {json.dumps(lt_macd_series)}\nRSI indicators (14-Period): {json.dumps(lt_rsi_series)}\n\n"
+
+                    all_market_data += market_data
+                    asset_prices[asset] = current_price
+                except Exception as e:
+                    import traceback
+                    add_event(f"Data gather error {asset}: {e}")
+                    continue
+
+            # Single LLM call with all assets
+            context = (
+                f"It has been {minutes_since_start:.0f} minutes since you started trading. "
+                f"The current time is {datetime.now()} and you've been invoked {invocation_count} times.\n\n"
+                f"CURRENT MARKET STATE FOR ALL COINS\n{all_market_data}\n"
+                f"HERE IS YOUR ACCOUNT INFORMATION & PERFORMANCE\n{account_info}\n\n"
+                f"Decide actions for ALL assets: {', '.join(args.assets)}. Output JSON array."
+            )
+            add_event(f"Combined prompt length: {len(context)} chars for {len(args.assets)} assets")
+            with open("prompts.log", "a") as f:
+                f.write(f"\n\n--- {datetime.now()} - ALL ASSETS ---\n{context}\n")
+
+            try:
+                outputs = agent.decide_trade_multi(args.assets, context)
+                if not isinstance(outputs, list):
+                    add_event(f"Invalid output format (expected list): {outputs}")
+                    outputs = []
+            except Exception as e:
+                import traceback
+                add_event(f"Agent error: {e}")
+                add_event(f"Traceback: {traceback.format_exc()}")
+                outputs = []
+
+            # Execute trades for each asset
+            for output in outputs:
+                try:
+                    asset = output.get("asset")
+                    if not asset or asset not in args.assets:
+                        continue
+                    action = output.get("action")
+                    current_price = asset_prices.get(asset, 0)
+                    action = output["action"]
+                    if action in ("buy", "sell"):
+                        is_buy = action == "buy"
+                        alloc_usd = float(output.get("allocation_usd", 0.0))
+                        if alloc_usd <= 0:
+                            add_event(f"Holding {asset}: zero/negative allocation")
+                            continue
+                        amount = alloc_usd / current_price
+
+                        order = await hyperliquid.place_buy_order(asset, amount) if is_buy else await hyperliquid.place_sell_order(asset, amount)
+                        trade_log.append({"type": action, "price": current_price, "amount": amount, "exit_plan": output["exit_plan"]})
+                        tp_oid = None
+                        sl_oid = None
+                        if output["tp_price"]:
+                            tp_order = await hyperliquid.place_take_profit(asset, is_buy, amount, output["tp_price"])
+                            tp_oids = hyperliquid.extract_oids(tp_order)
+                            tp_oid = tp_oids[0] if tp_oids else None
+                            add_event(f"TP placed {asset} at {output['tp_price']}")
+                        if output["sl_price"]:
+                            sl_order = await hyperliquid.place_stop_loss(asset, is_buy, amount, output["sl_price"])
+                            sl_oids = hyperliquid.extract_oids(sl_order)
+                            sl_oid = sl_oids[0] if sl_oids else None
+                            add_event(f"SL placed {asset} at {output['sl_price']}")
+                        active_trades.append({
+                            "asset": asset,
+                            "is_long": is_buy,
+                            "amount": amount,
+                            "entry_price": current_price,
+                            "tp_oid": tp_oid,
+                            "sl_oid": sl_oid,
+                            "exit_plan": output["exit_plan"]
+                        })
+                        add_event(f"{action.upper()} {asset} amount {amount:.4f} at ~{current_price}")
+                        # Write to diary
+                        with open(diary_path, "a") as f:
+                            diary_entry = {
+                                "timestamp": datetime.now().isoformat(),
+                                "asset": asset,
+                                "action": action,
+                                "allocation_usd": alloc_usd,
+                                "amount": amount,
+                                "entry_price": current_price,
+                                "tp_price": output.get("tp_price"),
+                                "tp_oid": tp_oid,
+                                "sl_price": output.get("sl_price"),
+                                "sl_oid": sl_oid,
+                                "exit_plan": output.get("exit_plan", ""),
+                                "rationale": output.get("rationale", ""),
+                                "order_result": str(order)
+                            }
+                            f.write(json.dumps(diary_entry) + "\n")
+                    else:
+                        add_event(f"Hold {asset}: {output.get('rationale', '')}")
+                        # Write hold to diary
+                        with open(diary_path, "a") as f:
+                            diary_entry = {
+                                "timestamp": datetime.now().isoformat(),
+                                "asset": asset,
+                                "action": "hold",
+                                "rationale": output.get("rationale", "")
+                            }
+                            f.write(json.dumps(diary_entry) + "\n")
+                except Exception as e:
+                    import traceback
+                    add_event(f"Execution error {asset}: {e}")
+
+            await asyncio.sleep(get_interval_seconds(args.interval))
+
+    def calculate_total_return(state, trade_log):
+        initial = 10000
+        current = state['balance'] + sum(p.get('pnl', 0) for p in state.get('positions', []))
+        return ((current - initial) / initial) * 100 if initial else 0
+
+    def calculate_sharpe(returns):
+        if not returns:
+            return 0
+        vals = [r.get('pnl', 0) if 'pnl' in r else 0 for r in returns]
+        if not vals:
+            return 0
+        mean = sum(vals) / len(vals)
+        var = sum((v - mean) ** 2 for v in vals) / len(vals)
+        std = math.sqrt(var) if var > 0 else 0
+        return mean / std if std > 0 else 0
+
+    async def check_exit_condition(trade, taapi, hyperliquid):
+        plan = (trade.get("exit_plan") or "").lower()
+        if not plan:
+            return False
+        try:
+            if "macd" in plan and "below" in plan:
+                macd = taapi.get_indicators(trade["asset"], "4h")["macd"]["valueMACD"]
+                threshold = float(plan.split("below")[-1].strip())
+                return macd < threshold
+            if "close above ema50" in plan:
+                ema50 = taapi.get_historical_indicator("ema", f"{trade['asset']}/USDT", "4h", results=1, params={"period": 50})[0]["value"]
+                current = await hyperliquid.get_current_price(trade["asset"])
+                return current > ema50
+        except Exception:
+            return False
+        return False
+
+    asyncio.run(run_loop())
+
+
+if __name__ == "__main__":
+    main()

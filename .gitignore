@@ -1,0 +1,31 @@
+# Environments
+.env
+.env.*
+!.env.example
+
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+*.egg-info/
+*.egg
+
+# Virtual envs
+.venv/
+venv/
+
+# Editors/OS
+.DS_Store
+.idea/
+.vscode/
+
+# Caches
+.pytest_cache/
+.mypy_cache/
+.cache/
+
+llm_requests.log
+trading_history.log
+*.log
+diary.jsonl
