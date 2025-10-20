@@ -10,8 +10,12 @@ import logging
 
 class HyperliquidAPI:
     def __init__(self):
-        private_key = CONFIG["hyperliquid_private_key"]
-        self.wallet = Account.from_key(private_key)
+        if "hyperliquid_private_key" in CONFIG and CONFIG["hyperliquid_private_key"]:
+            self.wallet = Account.from_key(CONFIG["hyperliquid_private_key"])
+        elif "mnemonic" in CONFIG and CONFIG["mnemonic"]:
+            self.wallet = Account.from_mnemonic(CONFIG["mnemonic"])
+        else:
+            raise ValueError("Either HYPERLIQUID_PRIVATE_KEY/LIGHTER_PRIVATE_KEY or MNEMONIC must be provided")
         # Choose base URL: allow override via env-config; default MAINNET
         base_url = CONFIG.get("hyperliquid_base_url") or constants.MAINNET_API_URL
         self.info = Info(base_url)

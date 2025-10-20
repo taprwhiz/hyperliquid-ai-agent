@@ -11,7 +11,8 @@ def _get_env(name: str, default: str | None = None, required: bool = False) -> s
 
 CONFIG = {
     "taapi_api_key": _get_env("TAAPI_API_KEY", required=True),
-    "hyperliquid_private_key": _get_env("HYPERLIQUID_PRIVATE_KEY") or _get_env("LIGHTER_PRIVATE_KEY", required=True),
+    "hyperliquid_private_key": _get_env("HYPERLIQUID_PRIVATE_KEY") or _get_env("LIGHTER_PRIVATE_KEY"),
+    "mnemonic": _get_env("MNEMONIC"),
     # LLM via OpenRouter
     "openrouter_api_key": _get_env("OPENROUTER_API_KEY", required=True),
     "openrouter_base_url": _get_env("OPENROUTER_BASE_URL", "https://openrouter.ai/api/v1"),
