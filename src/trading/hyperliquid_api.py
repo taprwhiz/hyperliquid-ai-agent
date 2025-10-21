@@ -6,6 +6,9 @@ from hyperliquid.exchange import Exchange
 from hyperliquid.info import Info
 from hyperliquid.utils import constants  # For MAINNET/TESTNET
 from eth_account import Account
+from websocket._exceptions import WebSocketConnectionClosedException
+import socket
+import time
 import logging
 
 class HyperliquidAPI:
@@ -16,10 +19,52 @@ class HyperliquidAPI:
             self.wallet = Account.from_mnemonic(CONFIG["mnemonic"])
         else:
             raise ValueError("Either HYPERLIQUID_PRIVATE_KEY/LIGHTER_PRIVATE_KEY or MNEMONIC must be provided")
-        # Choose base URL: allow override via env-config; default MAINNET
-        base_url = CONFIG.get("hyperliquid_base_url") or constants.MAINNET_API_URL
-        self.info = Info(base_url)
-        self.exchange = Exchange(self.wallet, base_url)
+        # Choose base URL: allow override via env-config; fallback to network selection
+        network = (CONFIG.get("hyperliquid_network") or "mainnet").lower()
+        base_url = CONFIG.get("hyperliquid_base_url")
+        if not base_url:
+            if network == "testnet":
+                base_url = getattr(constants, "TESTNET_API_URL", constants.MAINNET_API_URL)
+            else:
+                base_url = constants.MAINNET_API_URL
+        self.base_url = base_url
+        self._build_clients()
+
+    def _build_clients(self):
+        self.info = Info(self.base_url)
+        self.exchange = Exchange(self.wallet, self.base_url)
+
+    def _reset_clients(self):
+        try:
+            self._build_clients()
+            logging.warning("Hyperliquid clients re-instantiated after connection issue")
+        except Exception as e:
+            logging.error(f"Failed to reset Hyperliquid clients: {e}")
+
+    async def _retry(self, fn, *args, max_attempts: int = 3, backoff_base: float = 0.5, reset_on_fail: bool = True, to_thread: bool = True, **kwargs):
+        last_err = None
+        for attempt in range(max_attempts):
+            try:
+                if to_thread:
+                    return await asyncio.to_thread(fn, *args, **kwargs)
+                return await fn(*args, **kwargs)
+            except (WebSocketConnectionClosedException, aiohttp.ClientError, ConnectionError, TimeoutError, socket.timeout) as e:
+                last_err = e
+                logging.warning(f"HL call failed (attempt {attempt + 1}/{max_attempts}): {e}")
+                if reset_on_fail:
+                    self._reset_clients()
+                await asyncio.sleep(backoff_base * (2 ** attempt))
+                continue
+            except Exception as e:
+                # Unknown errors: don't spin forever, but allow a quick reset once
+                last_err = e
+                logging.warning(f"HL call unexpected error (attempt {attempt + 1}/{max_attempts}): {e}")
+                if reset_on_fail and attempt == 0:
+                    self._reset_clients()
+                    await asyncio.sleep(backoff_base)
+                    continue
+                break
+        raise last_err if last_err else RuntimeError("Hyperliquid retry: unknown error")
 
     def round_size(self, asset, amount):
         """Round amount to asset's szDecimals precision to avoid float_to_wire errors."""
@@ -34,31 +79,31 @@ class HyperliquidAPI:
 
     async def place_buy_order(self, asset, amount, slippage=0.01):
         amount = self.round_size(asset, amount)
-        return await asyncio.to_thread(self.exchange.market_open, asset, True, amount, None, slippage)
+        return await self._retry(lambda: self.exchange.market_open(asset, True, amount, None, slippage))
 
     async def place_sell_order(self, asset, amount, slippage=0.01):
         amount = self.round_size(asset, amount)
-        return await asyncio.to_thread(self.exchange.market_open, asset, False, amount, None, slippage)
+        return await self._retry(lambda: self.exchange.market_open(asset, False, amount, None, slippage))
 
     async def place_take_profit(self, asset, is_buy, amount, tp_price):
         # TP as trigger order (market close at tp_price, reduce-only)
         amount = self.round_size(asset, amount)
         order_type = {"trigger": {"triggerPx": tp_price, "isMarket": True, "tpsl": "tp"}}
-        return await asyncio.to_thread(self.exchange.order, asset, not is_buy, amount, tp_price, order_type, True)
+        return await self._retry(lambda: self.exchange.order(asset, not is_buy, amount, tp_price, order_type, True))
 
     async def place_stop_loss(self, asset, is_buy, amount, sl_price):
         # SL as trigger order (market close at sl_price, reduce-only)
         amount = self.round_size(asset, amount)
         order_type = {"trigger": {"triggerPx": sl_price, "isMarket": True, "tpsl": "sl"}}
-        return await asyncio.to_thread(self.exchange.order, asset, not is_buy, amount, sl_price, order_type, True)
+        return await self._retry(lambda: self.exchange.order(asset, not is_buy, amount, sl_price, order_type, True))
 
     async def cancel_order(self, asset, oid):
-        return await asyncio.to_thread(self.exchange.cancel, asset, oid)
+        return await self._retry(lambda: self.exchange.cancel(asset, oid))
 
     async def cancel_all_orders(self, asset):
         """Cancel all open orders for an asset."""
         try:
-            open_orders = await asyncio.to_thread(self.info.frontend_open_orders, self.wallet.address)
+            open_orders = await self._retry(lambda: self.info.frontend_open_orders(self.wallet.address))
             for order in open_orders:
                 if order.get("coin") == asset:
                     oid = order.get("oid")
@@ -72,7 +117,7 @@ class HyperliquidAPI:
     async def get_open_orders(self):
         """Return list of current open orders for this wallet."""
         try:
-            orders = await asyncio.to_thread(self.info.frontend_open_orders, self.wallet.address)
+            orders = await self._retry(lambda: self.info.frontend_open_orders(self.wallet.address))
             # Normalize trigger price if present in orderType
             for o in orders:
                 try:
@@ -93,9 +138,9 @@ class HyperliquidAPI:
         try:
             # Some SDK versions expose user_fills; fall back gracefully if absent
             if hasattr(self.info, 'user_fills'):
-                fills = await asyncio.to_thread(self.info.user_fills, self.wallet.address)
+                fills = await self._retry(lambda: self.info.user_fills(self.wallet.address))
             elif hasattr(self.info, 'fills'):
-                fills = await asyncio.to_thread(self.info.fills, self.wallet.address)
+                fills = await self._retry(lambda: self.info.fills(self.wallet.address))
             else:
                 return []
             if isinstance(fills, list):
@@ -119,7 +164,7 @@ class HyperliquidAPI:
         return oids
 
     async def get_user_state(self):
-        state = await asyncio.to_thread(self.info.user_state, self.wallet.address)
+        state = await self._retry(lambda: self.info.user_state(self.wallet.address))
         positions = state.get("assetPositions", [])
         for pos_wrap in positions:
             pos = pos_wrap["position"]
@@ -133,13 +178,13 @@ class HyperliquidAPI:
         return {"balance": balance, "positions": [p["position"] for p in positions]}
 
     async def get_current_price(self, asset):
-        mids = await asyncio.to_thread(self.info.all_mids)
+        mids = await self._retry(lambda: self.info.all_mids())
         return float(mids.get(asset, 0.0))
 
     async def get_meta_and_ctxs(self):
         """Cache meta and asset contexts to avoid repeated calls."""
         if not hasattr(self, '_meta_cache') or not self._meta_cache:
-            response = await asyncio.to_thread(self.info.meta_and_asset_ctxs)
+            response = await self._retry(lambda: self.info.meta_and_asset_ctxs())
             self._meta_cache = response
         return self._meta_cache
 

@@ -15,7 +15,7 @@ class TradingAgent:
         self.app_title = CONFIG.get("openrouter_app_title")
         self.taapi = TAAPIClient()
         # Fast/cheap sanitizer model to normalize outputs on parse failures
-        self.sanitize_model = CONFIG.get("sanitize_model") or "gpt-5-mini"
+        self.sanitize_model = CONFIG.get("sanitize_model") or "openai/gpt-5"
 
     def decide_trade(self, assets, context):
         """Decide for multiple assets in one call. Returns list of dicts."""
