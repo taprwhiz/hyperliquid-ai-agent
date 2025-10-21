@@ -23,7 +23,7 @@ class TradingAgent:
 
     def _decide(self, context, assets):
         system_prompt = (
-            "You are a rigorous quantitative trader and interdisciplinary mathematician-engineer optimizing risk-adjusted returns for perpetual futures on Hyperliquid under real execution, margin, and funding constraints.\n"
+            "You are a rigorous QUANTITATIVE TRADER and interdisciplinary MATHEMATICIAN-ENGINEER optimizing risk-adjusted returns for perpetual futures under real execution, margin, and funding constraints.\n"
             "You will receive market + account context for SEVERAL assets, including:\n"
             f"- assets = {json.dumps(assets)}\n"
             "- per-asset intraday (5m) and higher-timeframe (4h) metrics\n"
@@ -50,7 +50,7 @@ class TradingAgent:
             "  If sensible TP/SL cannot be set, use null and explain the logic.\n"
             "- exit_plan must include at least ONE explicit invalidation trigger and may include cooldown guidance you will follow later.\n\n"
             "Leverage policy (perpetual futures)\n"
-            "- YOU CAN USE LEVERAGE, KEEP IT WITHIN 5X IN TOTAL\n"
+            "- YOU CAN USE LEVERAGE, ATLEAST 2X LEVERAGE TO GET BETTER RETURN, KEEP IT WITHIN 5X IN TOTAL\n"
             "- In high volatility (elevated ATR) or during funding spikes, reduce or avoid leverage.\n"
             "- Treat allocation_usd as notional exposure; keep it consistent with safe leverage and available margin.\n\n"
             "Tool usage\n"
@@ -123,22 +123,29 @@ class TradingAgent:
             """Use a fast model to coerce any content into the exact JSON array schema."""
             try:
                 schema = {
-                    "type": "array",
-                    "items": {
-                        "type": "object",
-                        "properties": {
-                            "asset": {"type": "string", "enum": assets_list},
-                            "action": {"type": "string", "enum": ["buy", "sell", "hold"]},
-                            "allocation_usd": {"type": "number"},
-                            "tp_price": {"type": ["number", "null"]},
-                            "sl_price": {"type": ["number", "null"]},
-                            "exit_plan": {"type": "string"},
-                            "rationale": {"type": "string"},
-                        },
-                        "required": ["asset", "action", "allocation_usd", "tp_price", "sl_price", "exit_plan", "rationale"],
-                        "additionalProperties": False,
+                    "type": "object",
+                    "properties": {
+                        "trade_decisions": {
+                            "type": "array",
+                            "items": {
+                                "type": "object",
+                                "properties": {
+                                    "asset": {"type": "string", "enum": assets_list},
+                                    "action": {"type": "string", "enum": ["buy", "sell", "hold"]},
+                                    "allocation_usd": {"type": "number"},
+                                    "tp_price": {"type": ["number", "null"]},
+                                    "sl_price": {"type": ["number", "null"]},
+                                    "exit_plan": {"type": "string"},
+                                    "rationale": {"type": "string"},
+                                },
+                                "required": ["asset", "action", "allocation_usd", "tp_price", "sl_price", "exit_plan", "rationale"],
+                                "additionalProperties": False,
+                            },
+                            "minItems": 1,
+                        }
                     },
-                    "minItems": 1,
+                    "required": ["trade_decisions"],
+                    "additionalProperties": False,
                 }
                 payload = {
                     "model": self.sanitize_model,
@@ -164,9 +171,31 @@ class TradingAgent:
                 parsed = msg.get("parsed")
                 if isinstance(parsed, list):
                     return parsed
+                if isinstance(parsed, dict):
+                    arr = parsed.get("trade_decisions")
+                    if not isinstance(arr, list) and len(parsed) == 1:
+                        v = list(parsed.values())[0]
+                        if isinstance(v, list):
+                            arr = v
+                    if isinstance(arr, list):
+                        return arr
                 # fallback: try content
                 content = msg.get("content") or "[]"
-                return json.loads(content)
+                try:
+                    loaded = json.loads(content)
+                    if isinstance(loaded, dict):
+                        arr = loaded.get("trade_decisions")
+                        if not isinstance(arr, list) and len(loaded) == 1:
+                            v = list(loaded.values())[0]
+                            if isinstance(v, list):
+                                arr = v
+                        if isinstance(arr, list):
+                            return arr
+                    if isinstance(loaded, list):
+                        return loaded
+                except Exception:
+                    pass
+                return []
             except Exception as se:
                 logging.error(f"Sanitize failed: {se}")
                 return []
@@ -186,14 +215,21 @@ class TradingAgent:
             }
             required_keys = ["asset", "action", "allocation_usd", "tp_price", "sl_price", "exit_plan", "rationale"]
             return {
-                "type": "array",
-                "items": {
-                    "type": "object",
-                    "properties": base_properties,
-                    "required": required_keys,
-                    "additionalProperties": False,
+                "type": "object",
+                "properties": {
+                    "trade_decisions": {
+                        "type": "array",
+                        "items": {
+                            "type": "object",
+                            "properties": base_properties,
+                            "required": required_keys,
+                            "additionalProperties": False,
+                        },
+                        "minItems": 1,
+                    }
                 },
-                "minItems": 1,
+                "required": ["trade_decisions"],
+                "additionalProperties": False,
             }
 
         for _ in range(6):
