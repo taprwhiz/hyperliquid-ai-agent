@@ -14,17 +14,14 @@ class TradingAgent:
         self.referer = CONFIG.get("openrouter_referer")
         self.app_title = CONFIG.get("openrouter_app_title")
         self.taapi = TAAPIClient()
+        # Fast/cheap sanitizer model to normalize outputs on parse failures
+        self.sanitize_model = CONFIG.get("sanitize_model") or "gpt-5-mini"
 
-    def decide_trade_multi(self, assets, context):
+    def decide_trade(self, assets, context):
         """Decide for multiple assets in one call. Returns list of dicts."""
-        return self._decide(context, is_multi=True, assets=assets)
+        return self._decide(context, assets=assets)
 
-    def decide_trade(self, asset, context):
-        """Legacy single-asset decision."""
-        result = self._decide(context, is_multi=False, assets=[asset])
-        return result[0] if result else {"action": "hold", "allocation_usd": 0.0, "tp_price": None, "sl_price": None, "exit_plan": "", "rationale": "Error"}
-
-    def _decide(self, context, is_multi, assets):
+    def _decide(self, context, assets):
         system_prompt = (
             "You are a rigorous quantitative trader and interdisciplinary mathematician-engineer optimizing risk-adjusted returns for perpetual futures on Hyperliquid under real execution, margin, and funding constraints.\n"
             "You will receive market + account context for SEVERAL assets, including:\n"
@@ -122,6 +119,58 @@ class TradingAgent:
             resp.raise_for_status()
             return resp.json()
 
+        def _sanitize_to_array(raw_content: str, assets_list):
+            """Use a fast model to coerce any content into the exact JSON array schema."""
+            try:
+                schema = {
+                    "type": "array",
+                    "items": {
+                        "type": "object",
+                        "properties": {
+                            "asset": {"type": "string", "enum": assets_list},
+                            "action": {"type": "string", "enum": ["buy", "sell", "hold"]},
+                            "allocation_usd": {"type": "number"},
+                            "tp_price": {"type": ["number", "null"]},
+                            "sl_price": {"type": ["number", "null"]},
+                            "exit_plan": {"type": "string"},
+                            "rationale": {"type": "string"},
+                        },
+                        "required": ["asset", "action", "allocation_usd", "tp_price", "sl_price", "exit_plan", "rationale"],
+                        "additionalProperties": False,
+                    },
+                    "minItems": 1,
+                }
+                payload = {
+                    "model": self.sanitize_model,
+                    "messages": [
+                        {"role": "system", "content": (
+                            "You are a strict JSON normalizer. Return ONLY a JSON array matching the provided JSON Schema. "
+                            "If input is wrapped or has prose/markdown, fix it. Do not add fields."
+                        )},
+                        {"role": "user", "content": raw_content},
+                    ],
+                    "response_format": {
+                        "type": "json_schema",
+                        "json_schema": {
+                            "name": "trade_decisions",
+                            "strict": True,
+                            "schema": schema,
+                        },
+                    },
+                    "temperature": 0,
+                }
+                resp = _post(payload)
+                msg = resp.get("choices", [{}])[0].get("message", {})
+                parsed = msg.get("parsed")
+                if isinstance(parsed, list):
+                    return parsed
+                # fallback: try content
+                content = msg.get("content") or "[]"
+                return json.loads(content)
+            except Exception as se:
+                logging.error(f"Sanitize failed: {se}")
+                return []
+
         allow_tools = True
         allow_structured = True
 
@@ -136,24 +185,16 @@ class TradingAgent:
                 "rationale": {"type": "string"},
             }
             required_keys = ["asset", "action", "allocation_usd", "tp_price", "sl_price", "exit_plan", "rationale"]
-            if is_multi:
-                return {
-                    "type": "array",
-                    "items": {
-                        "type": "object",
-                        "properties": base_properties,
-                        "required": required_keys,
-                        "additionalProperties": False,
-                    },
-                    "minItems": 1,
-                }
-            else:
-                return {
+            return {
+                "type": "array",
+                "items": {
                     "type": "object",
                     "properties": base_properties,
                     "required": required_keys,
                     "additionalProperties": False,
-                }
+                },
+                "minItems": 1,
+            }
 
         for _ in range(6):
             data = {"model": self.model, "messages": messages}
@@ -236,81 +277,64 @@ class TradingAgent:
                 else:
                     content = message.get("content") or "{}"
                     parsed = json.loads(content)
-                if is_multi:
-                    if isinstance(parsed, list):
-                        result = []
-                        for item in parsed:
-                            if isinstance(item, dict):
-                                item.setdefault("allocation_usd", 0.0)
-                                item.setdefault("tp_price", None)
-                                item.setdefault("sl_price", None)
-                                item.setdefault("exit_plan", "")
-                                item.setdefault("rationale", "")
-                                result.append(item)
-                            elif isinstance(item, list) and len(item) >= 7:
-                                # Handle array format: [asset, action, alloc, tp, sl, exit_plan, rationale]
-                                result.append({
-                                    "asset": item[0],
-                                    "action": item[1],
-                                    "allocation_usd": float(item[2]) if item[2] else 0.0,
-                                    "tp_price": float(item[3]) if item[3] and item[3] != "null" else None,
-                                    "sl_price": float(item[4]) if item[4] and item[4] != "null" else None,
-                                    "exit_plan": item[5] if len(item) > 5 else "",
-                                    "rationale": item[6] if len(item) > 6 else ""
-                                })
-                        return result
-                    else:
-                        logging.error(f"Expected array for multi-asset, got: {type(parsed)}")
-                        return []
+                
+                # Unwrap if provider wrapped the array in a dict (e.g., {"trade_decisions": [...]})
+                if isinstance(parsed, dict):
+                    if len(parsed) == 1:
+                        key = list(parsed.keys())[0]
+                        if isinstance(parsed[key], list):
+                            parsed = parsed[key]
+                
+                if isinstance(parsed, list):
+                    result = []
+                    for item in parsed:
+                        if isinstance(item, dict):
+                            item.setdefault("allocation_usd", 0.0)
+                            item.setdefault("tp_price", None)
+                            item.setdefault("sl_price", None)
+                            item.setdefault("exit_plan", "")
+                            item.setdefault("rationale", "")
+                            result.append(item)
+                        elif isinstance(item, list) and len(item) >= 7:
+                            # Handle array format: [asset, action, alloc, tp, sl, exit_plan, rationale]
+                            result.append({
+                                "asset": item[0],
+                                "action": item[1],
+                                "allocation_usd": float(item[2]) if item[2] else 0.0,
+                                "tp_price": float(item[3]) if item[3] and item[3] != "null" else None,
+                                "sl_price": float(item[4]) if item[4] and item[4] != "null" else None,
+                                "exit_plan": item[5] if len(item) > 5 else "",
+                                "rationale": item[6] if len(item) > 6 else ""
+                            })
+                    return result
                 else:
-                    if isinstance(parsed, dict):
-                        parsed.setdefault("allocation_usd", 0.0)
-                        parsed.setdefault("tp_price", None)
-                        parsed.setdefault("sl_price", None)
-                        parsed.setdefault("exit_plan", "")
-                        parsed.setdefault("rationale", "")
-                        return [parsed]
-                    else:
-                        logging.error(f"Expected dict for single-asset, got: {type(parsed)}")
-                        return []
+                    logging.error(f"Expected array, got: {type(parsed)}; attempting sanitize")
+                    sanitized = _sanitize_to_array(content if 'content' in locals() else json.dumps(parsed), assets)
+                    if isinstance(sanitized, list) and sanitized:
+                        return sanitized
+                    return []
             except Exception as e:
                 logging.error(f"JSON parse error: {e}, content: {content[:200]}")
-                if is_multi:
-                    return [{
-                        "asset": a,
-                        "action": "hold",
-                        "allocation_usd": 0.0,
-                        "tp_price": None,
-                        "sl_price": None,
-                        "exit_plan": "",
-                        "rationale": "Parse error"
-                    } for a in assets]
-                else:
-                    return [{
-                        "action": "hold",
-                        "allocation_usd": 0.0,
-                        "tp_price": None,
-                        "sl_price": None,
-                        "exit_plan": "",
-                        "rationale": "Parse error"
-                    }]
+                # Try sanitizer as last resort
+                sanitized = _sanitize_to_array(content, assets)
+                if isinstance(sanitized, list) and sanitized:
+                    return sanitized
+                return [{
+                    "asset": a,
+                    "action": "hold",
+                    "allocation_usd": 0.0,
+                    "tp_price": None,
+                    "sl_price": None,
+                    "exit_plan": "",
+                    "rationale": "Parse error"
+                } for a in assets]
 
-        if is_multi:
-            return [{
-                "asset": a,
-                "action": "hold",
-                "allocation_usd": 0.0,
-                "tp_price": None,
-                "sl_price": None,
-                "exit_plan": "",
-                "rationale": "tool loop cap"
-            } for a in assets]
-        else:
-            return [{
-                "action": "hold",
-                "allocation_usd": 0.0,
-                "tp_price": None,
-                "sl_price": None,
-                "exit_plan": "",
-                "rationale": "tool loop cap"
-            }]
+        return [{
+            "asset": a,
+            "action": "hold",
+            "allocation_usd": 0.0,
+            "tp_price": None,
+            "sl_price": None,
+            "exit_plan": "",
+            "rationale": "tool loop cap"
+        } for a in assets]

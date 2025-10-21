@@ -1,6 +1,12 @@
 # Nocture: AI Trading Agent on Hyperliquid
 
-This project implements an AI-powered trading agent that leverages LLM models (via OpenRouter) to analyze real-time market data from TAAPI and CoinAPI, make informed trading decisions, and execute trades on the Hyperliquid decentralized exchange. The agent runs in a continuous loop, monitoring specified cryptocurrency assets at configurable intervals, using technical indicators to decide on buy/sell/hold actions, and manages positions with take-profit and stop-loss orders.
+This project implements an AI-powered trading agent that leverages LLM models to analyze real-time market data from TAAPI, make informed trading decisions, and execute trades on the Hyperliquid decentralized exchange. The agent runs in a continuous loop, monitoring specified cryptocurrency assets at configurable intervals, using technical indicators to decide on buy/sell/hold actions, and manages positions with take-profit and stop-loss orders.
+
+## Architecture
+
+See the full [Architecture Documentation](docs/ARCHITECTURE.md) for subsystems, data flow, and design principles.
+
+![Architecture Diagram](docs/architecture.png)
 
 ## Table of Contents
 
@@ -29,7 +35,6 @@ Populate `.env` (use `.env.example` as reference):
 - **TAAPI_API_KEY**: Sign up at [TAAPI.io](https://taapi.io/) and generate an API key from your dashboard.
 - **HYPERLIQUID_PRIVATE_KEY**: Generate an Ethereum-compatible private key for Hyperliquid. Use tools like MetaMask or `eth_account` library. For security, never share this key.
 - **OPENROUTER_API_KEY**: Create an account at [OpenRouter.ai](https://openrouter.ai/), then generate an API key in your account settings.
-- **COINAPI_KEY**: Register at [CoinAPI.io](https://www.coinapi.io/) and obtain a free or paid API key depending on your usage needs.
 - **LLM_MODEL**: No key needed; specify a model name like "x-ai/grok-4" (see OpenRouter models list).
 
 ## Usage

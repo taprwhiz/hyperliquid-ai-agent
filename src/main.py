@@ -315,7 +315,7 @@ def main():
                     return True
 
             try:
-                outputs = agent.decide_trade_multi(args.assets, context)
+                outputs = agent.decide_trade(args.assets, context)
                 if not isinstance(outputs, list):
                     add_event(f"Invalid output format (expected list): {outputs}")
                     outputs = []
@@ -332,7 +332,7 @@ def main():
                     "## Retry Instruction\nReturn ONLY the JSON array per schema with no prose.\n\n" + context
                 )
                 try:
-                    outputs = agent.decide_trade_multi(args.assets, context_retry)
+                    outputs = agent.decide_trade(args.assets, context_retry)
                     if not isinstance(outputs, list):
                         add_event(f"Retry invalid format: {outputs}")
                         outputs = []
