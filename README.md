@@ -2,19 +2,26 @@
 
 This project implements an AI-powered trading agent that leverages LLM models to analyze real-time market data from TAAPI, make informed trading decisions, and execute trades on the Hyperliquid decentralized exchange. The agent runs in a continuous loop, monitoring specified cryptocurrency assets at configurable intervals, using technical indicators to decide on buy/sell/hold actions, and manages positions with take-profit and stop-loss orders.
 
+## Table of Contents
+
+- [Architecture](#architecture)
+- [Structure](#structure)
+- [Env Configuration](#env-configuration)
+- [Usage](#usage)
+- [Tool Calling](#tool-calling)
+- [Deployment to EigenCloud](#deployment-to-eigencloud)
+
 ## Architecture
 
 See the full [Architecture Documentation](docs/ARCHITECTURE.md) for subsystems, data flow, and design principles.
 
 ![Architecture Diagram](docs/architecture.png)
 
-## Table of Contents
+## Nocturne Live Agents 
 
-- [Structure](#structure)
-- [Env Configuration](#env-configuration)
-- [Usage](#usage)
-- [Tool Calling](#tool-calling)
-- [Deployment to EigenCloud](#deployment-to-eigencloud)
+- GPT-5 Pro: https://hypurrscan.io/address/0xa049db4b3dfcb25c3092891010a629d987d26113 (Seeded with $200)
+- DeepSeek R1: https://hypurrscan.io/address/0xa663c80d86fd7c045d9927bb6344d7a5827d31db (Seeded with $100)
+- Grok 4: https://hypurrscan.io/address/0x3c71f3cf324d0133558c81d42543115ef1a2be79 (Seeded with $100)
 
 ## Structure
 - `src/main.py`: Entry point, handles user input and main trading loop.
