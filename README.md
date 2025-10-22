@@ -4,12 +4,18 @@ This project implements an AI-powered trading agent that leverages LLM models to
 
 ## Table of Contents
 
+- [Disclaimer](#disclaimer)
 - [Architecture](#architecture)
+- [Nocturne Live Agents](#nocturne-live-agents)
 - [Structure](#structure)
 - [Env Configuration](#env-configuration)
 - [Usage](#usage)
 - [Tool Calling](#tool-calling)
 - [Deployment to EigenCloud](#deployment-to-eigencloud)
+
+## Disclaimer
+
+There is no guarantee of any returns. This code has not been audited. Please use at your own risk.
 
 ## Architecture
 
