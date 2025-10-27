@@ -1,3 +1,5 @@
+"""Entry-point script that wires together the trading agent, data feeds, and API."""
+
 import sys
 import argparse
 import pathlib
@@ -5,10 +7,9 @@ sys.path.append(str(pathlib.Path(__file__).parent.parent))
 from src.agent.decision_maker import TradingAgent
 from src.indicators.taapi_client import TAAPIClient
 from src.trading.hyperliquid_api import HyperliquidAPI
-import time
 import asyncio
 import logging
-from collections import deque
+from collections import deque, OrderedDict
 from datetime import datetime, timezone
 import math  # For Sharpe
 from dotenv import load_dotenv
@@ -16,15 +17,20 @@ import os
 import json
 from aiohttp import web
 from src.utils.formatting import format_number as fmt, format_size as fmt_sz
+from src.utils.prompt_utils import json_default, round_or_none, round_series
 
 load_dotenv()
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
 
+
 def clear_terminal():
+    """Clear the terminal screen on Windows or POSIX systems."""
     os.system('cls' if os.name == 'nt' else 'clear')
 
+
 def get_interval_seconds(interval_str):
+    """Convert interval strings like '5m' or '1h' to seconds."""
     if interval_str.endswith('m'):
         return int(interval_str[:-1]) * 60
     elif interval_str.endswith('h'):
@@ -35,6 +41,7 @@ def get_interval_seconds(interval_str):
         raise ValueError(f"Unsupported interval: {interval_str}")
 
 def main():
+    """Parse CLI args, bootstrap dependencies, and launch the trading loop."""
     clear_terminal()
     parser = argparse.ArgumentParser(description="LLM-based Trading Agent on Hyperliquid")
     parser.add_argument("--assets", type=str, nargs="+", required=False, help="Assets to trade, e.g., BTC ETH")
@@ -75,87 +82,68 @@ def main():
     print(f"Starting trading agent for assets: {args.assets} at interval: {args.interval}")
 
     def add_event(msg: str):
+        """Log an informational event and push it into the recent events deque."""
         logging.info(msg)
 
     async def run_loop():
+        """Main trading loop that gathers data, calls the agent, and executes trades."""
         nonlocal invocation_count, initial_account_value
         while True:
             invocation_count += 1
             minutes_since_start = (datetime.now(timezone.utc) - start_time).total_seconds() / 60
 
-            # number formatting helpers imported from src.utils.formatting
-
             # Global account state
             state = await hyperliquid.get_user_state()
+            total_value = state.get('total_value') or state['balance'] + sum(p.get('pnl', 0) for p in state['positions'])
             sharpe = calculate_sharpe(trade_log)
 
-            # Format account info like example
-            account_value = state['balance'] + sum(p.get('pnl', 0) for p in state['positions'])
+            account_value = total_value
             if initial_account_value is None:
                 initial_account_value = account_value
-            total_return = ((account_value - initial_account_value) / initial_account_value * 100.0) if initial_account_value else 0.0
-            account_info = f"Current Total Return (percent): {total_return:.2f}%\nAvailable Cash: {fmt(state['balance'], 2)}\nCurrent Account Value: {fmt(account_value, 2)}\nSharpe Ratio: {sharpe:.3f}\nCurrent live positions & performance:\n"
-            for pos in state['positions']:
+            total_return_pct = ((account_value - initial_account_value) / initial_account_value * 100.0) if initial_account_value else 0.0
+
+            positions = []
+            for pos_wrap in state['positions']:
+                pos = pos_wrap
                 coin = pos.get('coin')
-                current_px = round(await hyperliquid.get_current_price(coin), 2) if coin else 0
-                liq_px = fmt(pos.get('liquidationPx') or pos.get('liqPx', 0), 2)
-                qty_disp = fmt_sz(pos.get('szi'))
-                entry_disp = fmt(pos.get('entryPx'), 2)
-                pnl_disp = fmt(pos.get('pnl', 0), 4)
-                account_info += f"{{'symbol': '{coin}', 'quantity': {qty_disp}, 'entry_price': {entry_disp}, 'current_price': {current_px}, 'liquidation_price': {liq_px}, 'unrealized_pnl': {pnl_disp}, 'leverage': {pos.get('leverage', 1)}, ...}}\n"
-            account_info += "\nActive Trades with Exit Plans:\n"
-            for trade in active_trades:
-                opened_at_str = trade.get('opened_at')
-                minutes_open = 0.0
-                if opened_at_str:
-                    try:
-                        minutes_open = (datetime.now() - datetime.fromisoformat(opened_at_str)).total_seconds() / 60
-                    except Exception:
-                        minutes_open = 0.0
-                amt_disp = fmt_sz(trade['amount'])
-                entry_trade_disp = fmt(trade['entry_price'], 2)
-                account_info += (
-                    f"Asset: {trade['asset']}, Long: {trade['is_long']}, Amount: {amt_disp}, "
-                    f"Entry: {entry_trade_disp}, Opened: {opened_at_str}, MinutesOpen: {minutes_open:.1f}, "
-                    f"TP OID: {trade['tp_oid']}, SL OID: {trade['sl_oid']}, Exit Plan: {trade['exit_plan']}\n"
-                )
-            
-            # Include recent diary entries for context
-            account_info += "\nRecent Trading History (last 10 decisions):\n"
+                current_px = await hyperliquid.get_current_price(coin) if coin else None
+                positions.append({
+                    "symbol": coin,
+                    "quantity": round_or_none(pos.get('szi'), 6),
+                    "entry_price": round_or_none(pos.get('entryPx'), 2),
+                    "current_price": round_or_none(current_px, 2),
+                    "liquidation_price": round_or_none(pos.get('liquidationPx') or pos.get('liqPx'), 2),
+                    "unrealized_pnl": round_or_none(pos.get('pnl'), 4),
+                    "leverage": pos.get('leverage')
+                })
+
+            recent_diary = []
             try:
                 with open(diary_path, "r") as f:
                     lines = f.readlines()
                     for line in lines[-10:]:
                         entry = json.loads(line)
-                        account_info += f"{entry.get('timestamp', '')} - {entry.get('asset', '')}: {entry.get('action', '')} - {entry.get('rationale', '')[:80]}\n"
+                        recent_diary.append(entry)
             except Exception:
                 pass
 
-            # Include active open orders context (TP/SL or any resting orders)
+            open_orders_struct = []
             try:
                 open_orders = await hyperliquid.get_open_orders()
-                account_info += "\nActive Open Orders:\n"
-                for o in open_orders[:50]:  # cap to 50 for prompt size
-                    coin = o.get('coin')
-                    oid = o.get('oid')
-                    side = o.get('isBuy')
-                    sz = fmt_sz(o.get('sz'))
-                    raw_px = o.get('px')
-                    px = fmt(raw_px, 2) if raw_px not in (None, "None") else None
-                    trig_px = o.get('triggerPx')
-                    order_type_obj = o.get('orderType')
-                    if isinstance(order_type_obj, dict) and len(order_type_obj.keys()) > 0:
-                        order_type = list(order_type_obj.keys())[0]
-                    else:
-                        order_type = str(order_type_obj)
-                    if trig_px is not None and px is None:
-                        account_info += f"oid:{oid} {coin} {'BUY' if side else 'SELL'} sz:{sz} triggerPx:{fmt(trig_px,2)} type:{order_type}\n"
-                    else:
-                        account_info += f"oid:{oid} {coin} {'BUY' if side else 'SELL'} sz:{sz} px:{px} type:{order_type}\n"
+                for o in open_orders[:50]:
+                    open_orders_struct.append({
+                        "coin": o.get('coin'),
+                        "oid": o.get('oid'),
+                        "is_buy": o.get('isBuy'),
+                        "size": round_or_none(o.get('sz'), 6),
+                        "price": round_or_none(o.get('px'), 2),
+                        "trigger_price": round_or_none(o.get('triggerPx'), 2),
+                        "order_type": o.get('orderType')
+                    })
             except Exception:
-                pass
+                open_orders = []
 
-            # Reconcile active_trades with authoritative exchange state (positions + open orders)
+            # Reconcile active trades
             try:
                 assets_with_positions = set()
                 for pos in state['positions']:
@@ -164,7 +152,7 @@ def main():
                             assets_with_positions.add(pos.get('coin'))
                     except Exception:
                         continue
-                assets_with_orders = set([o.get('coin') for o in (open_orders or []) if o.get('coin')])
+                assets_with_orders = {o.get('coin') for o in (open_orders or []) if o.get('coin')}
                 for tr in active_trades[:]:
                     asset = tr.get('asset')
                     if asset not in assets_with_positions and asset not in assets_with_orders:
@@ -181,169 +169,191 @@ def main():
             except Exception:
                 pass
 
-            # Include recent fills to reflect executed TP/SL
+            recent_fills_struct = []
             try:
                 fills = await hyperliquid.get_recent_fills(limit=50)
-                account_info += "\nRecent Fills (latest 20):\n"
-                for f in fills[-20:]:
+                for f_entry in fills[-20:]:
                     try:
-                        coin = f.get('coin') or f.get('asset')
-                        is_buy = f.get('isBuy')
-                        sz = fmt_sz(f.get('sz') or f.get('size'))
-                        px = fmt(f.get('px') or f.get('price'), 2)
-                        t_raw = f.get('time') or f.get('timestamp')
-                        try:
-                            # convert ms or s to ISO
-                            t_int = int(t_raw)
-                            if t_int > 1e12:
-                                t_iso = datetime.fromtimestamp(t_int / 1000, tz=timezone.utc).isoformat()
-                            else:
-                                t_iso = datetime.fromtimestamp(t_int, tz=timezone.utc).isoformat()
-                        except Exception:
-                            t_iso = str(t_raw)
-                        account_info += f"{t_iso} {coin} {'BUY' if is_buy else 'SELL'} sz:{sz} px:{px}\n"
+                        t_raw = f_entry.get('time') or f_entry.get('timestamp')
+                        timestamp = None
+                        if t_raw is not None:
+                            try:
+                                t_int = int(t_raw)
+                                if t_int > 1e12:
+                                    timestamp = datetime.fromtimestamp(t_int / 1000, tz=timezone.utc).isoformat()
+                                else:
+                                    timestamp = datetime.fromtimestamp(t_int, tz=timezone.utc).isoformat()
+                            except Exception:
+                                timestamp = str(t_raw)
+                        recent_fills_struct.append({
+                            "timestamp": timestamp,
+                            "coin": f_entry.get('coin') or f_entry.get('asset'),
+                            "is_buy": f_entry.get('isBuy'),
+                            "size": round_or_none(f_entry.get('sz') or f_entry.get('size'), 6),
+                            "price": round_or_none(f_entry.get('px') or f_entry.get('price'), 2)
+                        })
                     except Exception:
                         continue
             except Exception:
                 pass
 
-            # Check and close if exit conditions met
-            for trade in active_trades[:]:
-                if await check_exit_condition(trade, taapi, hyperliquid):
-                    close_order = await hyperliquid.place_sell_order(trade['asset'], trade['amount']) if trade['is_long'] else await hyperliquid.place_buy_order(trade['asset'], trade['amount'])
-                    add_event(f"Closed {trade['asset']} due to exit plan: {trade['exit_plan']}")
-                    # Cancel all remaining orders for this asset (TP/SL and any orphans)
-                    cancel_result = await hyperliquid.cancel_all_orders(trade['asset'])
-                    add_event(f"Cancelled {cancel_result.get('cancelled_count', 0)} orders for {trade['asset']}")
-                    active_trades.remove(trade)
-                    # Log to diary
-                    with open(diary_path, "a") as f:
-                        f.write(json.dumps({
-                            "timestamp": datetime.now().isoformat(),
-                            "asset": trade['asset'],
-                            "action": "close",
-                            "reason": "exit_plan_triggered",
-                            "exit_plan": trade['exit_plan'],
-                            "opened_at": trade.get('opened_at')
-                        }) + "\n")
+            dashboard = {
+                "total_return_pct": round(total_return_pct, 2),
+                "balance": round_or_none(state['balance'], 2),
+                "account_value": round_or_none(account_value, 2),
+                "sharpe_ratio": round_or_none(sharpe, 3),
+                "positions": positions,
+                "active_trades": [
+                    {
+                        "asset": tr.get('asset'),
+                        "is_long": tr.get('is_long'),
+                        "amount": round_or_none(tr.get('amount'), 6),
+                        "entry_price": round_or_none(tr.get('entry_price'), 2),
+                        "tp_oid": tr.get('tp_oid'),
+                        "sl_oid": tr.get('sl_oid'),
+                        "exit_plan": tr.get('exit_plan'),
+                        "opened_at": tr.get('opened_at')
+                    }
+                    for tr in active_trades
+                ],
+                "open_orders": open_orders_struct,
+                "recent_diary": recent_diary,
+                "recent_fills": recent_fills_struct,
+            }
 
             # Gather data for ALL assets first
-            all_market_data = ""
+            market_sections = []
             asset_prices = {}
             for asset in args.assets:
                 try:
-                    # Gather data like example
-                    current_price = round(await hyperliquid.get_current_price(asset), 2)
-                    # Update perp mid-price history (sampled per loop)
+                    current_price = await hyperliquid.get_current_price(asset)
+                    asset_prices[asset] = current_price
                     if asset not in price_history:
                         price_history[asset] = deque(maxlen=60)
-                    price_history[asset].append({"t": datetime.now(timezone.utc).isoformat(), "mid": fmt(current_price, 2)})
+                    price_history[asset].append({"t": datetime.now(timezone.utc).isoformat(), "mid": round_or_none(current_price, 2)})
                     oi = await hyperliquid.get_open_interest(asset)
                     funding = await hyperliquid.get_funding_rate(asset)
-
-                    # Initial indicators (intraday) from TAAPI only; avoid spot/perp basis mismatch
-                    indicators = taapi.get_indicators(asset, args.interval)
-                    hist_prices = []
 
                     intraday_tf = "5m"
                     ema_series = taapi.fetch_series("ema", f"{asset}/USDT", intraday_tf, results=10, params={"period": 20}, value_key="value")
                     macd_series = taapi.fetch_series("macd", f"{asset}/USDT", intraday_tf, results=10, value_key="valueMACD")
                     rsi7_series = taapi.fetch_series("rsi", f"{asset}/USDT", intraday_tf, results=10, params={"period": 7}, value_key="value")
                     rsi14_series = taapi.fetch_series("rsi", f"{asset}/USDT", intraday_tf, results=10, params={"period": 14}, value_key="value")
-                    cur_rsi7 = round(rsi7_series[-1], 2) if rsi7_series else "N/A"
-                    cur_ema20 = round(ema_series[-1], 2) if ema_series else "N/A"
-                    cur_macd = round(macd_series[-1], 2) if macd_series else "N/A"
-                    ema_series_r = [fmt(v, 2) for v in ema_series] if ema_series else []
-                    macd_series_r = [fmt(v, 2) for v in macd_series] if macd_series else []
-                    rsi7_series_r = [fmt(v, 2) for v in rsi7_series] if rsi7_series else []
-                    rsi14_series_r = [fmt(v, 2) for v in rsi14_series] if rsi14_series else []
 
-                    # Long-term (4h)
                     lt_ema20 = taapi.fetch_value("ema", f"{asset}/USDT", "4h", params={"period": 20}, key="value")
-                    lt_ema20 = round(lt_ema20, 2) if lt_ema20 is not None else "N/A"
                     lt_ema50 = taapi.fetch_value("ema", f"{asset}/USDT", "4h", params={"period": 50}, key="value")
-                    lt_ema50 = round(lt_ema50, 2) if lt_ema50 is not None else "N/A"
                     lt_atr3 = taapi.fetch_value("atr", f"{asset}/USDT", "4h", params={"period": 3}, key="value")
-                    lt_atr3 = round(lt_atr3, 2) if lt_atr3 is not None else "N/A"
                     lt_atr14 = taapi.fetch_value("atr", f"{asset}/USDT", "4h", params={"period": 14}, key="value")
-                    lt_atr14 = round(lt_atr14, 2) if lt_atr14 is not None else "N/A"
                     lt_macd_series = taapi.fetch_series("macd", f"{asset}/USDT", "4h", results=10, value_key="valueMACD")
                     lt_rsi_series = taapi.fetch_series("rsi", f"{asset}/USDT", "4h", results=10, params={"period": 14}, value_key="value")
-                    lt_macd_series_r = [fmt(v, 2) for v in lt_macd_series] if lt_macd_series else []
-                    lt_rsi_series_r = [fmt(v, 2) for v in lt_rsi_series] if lt_rsi_series else []
 
-                    # Format like example
-                    # Compute annualized funding (paid hourly: × 24 × 365)
+                    recent_mids = [entry["mid"] for entry in list(price_history.get(asset, []))[-10:]]
                     funding_annualized = round(funding * 24 * 365 * 100, 2) if funding else None
-                    market_data = f"ALL {asset.upper()} DATA\ncurrent_price = {current_price}, current_ema20 = {cur_ema20}, current_macd = {cur_macd}, current_rsi (7 period) = {cur_rsi7}\n"
-                    market_data += f"Open Interest: {oi}\nFunding Rate: {funding} (Annualized: {funding_annualized}%)\n"
-                    # Perp mid prices sampled per interval (authoritative, concise)
-                    recent_mids = [p["mid"] for p in list(price_history.get(asset, []))[-10:]]
-                    market_data += f"Perp mid prices (sampled): {json.dumps(recent_mids)}\n"
-                    market_data += f"EMA indicators (20-period): {json.dumps(ema_series_r)}\n"
-                    market_data += f"MACD indicators: {json.dumps(macd_series_r)}\n"
-                    market_data += f"RSI indicators (7-Period): {json.dumps(rsi7_series_r)}\n"
-                    market_data += f"RSI indicators (14-Period): {json.dumps(rsi14_series_r)}\n"
-                    market_data += f"Longer-term context (4-hour timeframe):\n20-Period EMA: {lt_ema20} vs. 50-Period EMA: {lt_ema50}\n3-Period ATR: {lt_atr3} vs. {lt_atr14}\nMACD indicators: {json.dumps(lt_macd_series_r)}\nRSI indicators (14-Period): {json.dumps(lt_rsi_series_r)}\n\n"
 
-                    all_market_data += market_data
-                    asset_prices[asset] = current_price
+                    market_sections.append({
+                        "asset": asset,
+                        "current_price": round_or_none(current_price, 2),
+                        "intraday": {
+                            "ema20": round_or_none(ema_series[-1], 2) if ema_series else None,
+                            "macd": round_or_none(macd_series[-1], 2) if macd_series else None,
+                            "rsi7": round_or_none(rsi7_series[-1], 2) if rsi7_series else None,
+                            "rsi14": round_or_none(rsi14_series[-1], 2) if rsi14_series else None,
+                            "series": {
+                                "ema20": round_series(ema_series, 2),
+                                "macd": round_series(macd_series, 2),
+                                "rsi7": round_series(rsi7_series, 2),
+                                "rsi14": round_series(rsi14_series, 2)
+                            }
+                        },
+                        "long_term": {
+                            "ema20": round_or_none(lt_ema20, 2),
+                            "ema50": round_or_none(lt_ema50, 2),
+                            "atr3": round_or_none(lt_atr3, 2),
+                            "atr14": round_or_none(lt_atr14, 2),
+                            "macd_series": round_series(lt_macd_series, 2),
+                            "rsi_series": round_series(lt_rsi_series, 2)
+                        },
+                        "open_interest": round_or_none(oi, 2),
+                        "funding_rate": round_or_none(funding, 8),
+                        "funding_annualized_pct": funding_annualized,
+                        "recent_mid_prices": recent_mids
+                    })
                 except Exception as e:
-                    import traceback
                     add_event(f"Data gather error {asset}: {e}")
                     continue
 
             # Single LLM call with all assets
-            context = (
-                f"## Invocation\n"
-                f"It has been {minutes_since_start:.0f} minutes since you started trading. "
-                f"The current time is {datetime.now(timezone.utc).isoformat()} and you've been invoked {invocation_count} times.\n\n"
-                f"## Market Data\n{all_market_data}\n"
-                f"## Account Information & Performance\n{account_info}\n"
-                f"## Instructions\nDecide actions for ALL assets: {', '.join(args.assets)}. Output a STRICT JSON array only.\n"
-            )
+            context_payload = OrderedDict([
+                ("invocation", {
+                    "minutes_since_start": round(minutes_since_start, 2),
+                    "current_time": datetime.now(timezone.utc).isoformat(),
+                    "invocation_count": invocation_count
+                }),
+                ("account", dashboard),
+                ("market_data", market_sections),
+                ("instructions", {
+                    "assets": args.assets,
+                    "requirement": "Decide actions for all assets and return a strict JSON array matching the schema."
+                })
+            ])
+            context = json.dumps(context_payload, default=json_default)
             add_event(f"Combined prompt length: {len(context)} chars for {len(args.assets)} assets")
             with open("prompts.log", "a") as f:
-                f.write(f"\n\n--- {datetime.now()} - ALL ASSETS ---\n{context}\n")
+                f.write(f"\n\n--- {datetime.now()} - ALL ASSETS ---\n{json.dumps(context_payload, indent=2, default=json_default)}\n")
 
             def _is_failed_outputs(outs):
-                if not outs:
+                """Return True when outputs are missing or clearly invalid."""
+                if not isinstance(outs, dict):
+                    return True
+                decisions = outs.get("trade_decisions")
+                if not isinstance(decisions, list) or not decisions:
                     return True
                 try:
-                    return all(isinstance(o, dict) and (o.get('action') == 'hold') and ('parse error' in (o.get('rationale','').lower())) for o in outs)
+                    return all(
+                        isinstance(o, dict)
+                        and (o.get('action') == 'hold')
+                        and ('parse error' in (o.get('rationale', '').lower()))
+                        for o in decisions
+                    )
                 except Exception:
                     return True
 
             try:
                 outputs = agent.decide_trade(args.assets, context)
-                if not isinstance(outputs, list):
-                    add_event(f"Invalid output format (expected list): {outputs}")
-                    outputs = []
+                if not isinstance(outputs, dict):
+                    add_event(f"Invalid output format (expected dict): {outputs}")
+                    outputs = {}
             except Exception as e:
                 import traceback
                 add_event(f"Agent error: {e}")
                 add_event(f"Traceback: {traceback.format_exc()}")
-                outputs = []
+                outputs = {}
 
             # Retry once on failure/parse error with a stricter instruction prefix
             if _is_failed_outputs(outputs):
                 add_event("Retrying LLM once due to invalid/parse-error output")
-                context_retry = (
-                    "## Retry Instruction\nReturn ONLY the JSON array per schema with no prose.\n\n" + context
-                )
+                context_retry_payload = OrderedDict([
+                    ("retry_instruction", "Return ONLY the JSON array per schema with no prose."),
+                    ("original_context", context_payload)
+                ])
+                context_retry = json.dumps(context_retry_payload, default=json_default)
                 try:
                     outputs = agent.decide_trade(args.assets, context_retry)
-                    if not isinstance(outputs, list):
+                    if not isinstance(outputs, dict):
                         add_event(f"Retry invalid format: {outputs}")
-                        outputs = []
+                        outputs = {}
                 except Exception as e:
                     import traceback
                     add_event(f"Retry agent error: {e}")
                     add_event(f"Retry traceback: {traceback.format_exc()}")
-                    outputs = []
+                    outputs = {}
+
+            reasoning_text = outputs.get("reasoning", "") if isinstance(outputs, dict) else ""
+            if reasoning_text:
+                add_event(f"LLM reasoning summary: {reasoning_text}")
 
             # Execute trades for each asset
-            for output in outputs:
+            for output in outputs.get("trade_decisions", []) if isinstance(outputs, dict) else []:
                 try:
                     asset = output.get("asset")
                     if not asset or asset not in args.assets:
@@ -351,6 +361,9 @@ def main():
                     action = output.get("action")
                     current_price = asset_prices.get(asset, 0)
                     action = output["action"]
+                    rationale = output.get("rationale", "")
+                    if rationale:
+                        add_event(f"Decision rationale for {asset}: {rationale}")
                     if action in ("buy", "sell"):
                         is_buy = action == "buy"
                         alloc_usd = float(output.get("allocation_usd", 0.0))
@@ -402,6 +415,8 @@ def main():
                             "opened_at": datetime.now().isoformat()
                         })
                         add_event(f"{action.upper()} {asset} amount {amount:.4f} at ~{current_price}")
+                        if rationale:
+                            add_event(f"Post-trade rationale for {asset}: {rationale}")
                         # Write to diary after confirming fills status
                         with open(diary_path, "a") as f:
                             diary_entry = {
@@ -440,6 +455,7 @@ def main():
             await asyncio.sleep(get_interval_seconds(args.interval))
 
     async def handle_diary(request):
+        """Return diary entries as JSON or newline-delimited text."""
         try:
             raw = request.query.get('raw')
             download = request.query.get('download')
@@ -464,6 +480,7 @@ def main():
             return web.json_response({"error": str(e)}, status=500)
 
     async def handle_logs(request):
+        """Stream log files with optional download or tailing behaviour."""
         try:
             path = request.query.get('path', 'llm_requests.log')
             download = request.query.get('download')
@@ -483,10 +500,12 @@ def main():
             return web.json_response({"error": str(e)}, status=500)
 
     async def start_api(app):
+        """Register HTTP endpoints for observing diary entries and logs."""
         app.router.add_get('/diary', handle_diary)
         app.router.add_get('/logs', handle_logs)
 
     async def main_async():
+        """Start the aiohttp server and kick off the trading loop."""
         app = web.Application()
         await start_api(app)
         from src.config_loader import CONFIG as CFG
@@ -497,11 +516,13 @@ def main():
         await run_loop()
 
     def calculate_total_return(state, trade_log):
+        """Compute percent return relative to an assumed initial balance."""
         initial = 10000
         current = state['balance'] + sum(p.get('pnl', 0) for p in state.get('positions', []))
         return ((current - initial) / initial) * 100 if initial else 0
 
     def calculate_sharpe(returns):
+        """Compute a naive Sharpe-like ratio from the trade log."""
         if not returns:
             return 0
         vals = [r.get('pnl', 0) if 'pnl' in r else 0 for r in returns]
@@ -513,6 +534,7 @@ def main():
         return mean / std if std > 0 else 0
 
     async def check_exit_condition(trade, taapi, hyperliquid):
+        """Evaluate whether a given trade's exit plan triggers a close."""
         plan = (trade.get("exit_plan") or "").lower()
         if not plan:
             return False

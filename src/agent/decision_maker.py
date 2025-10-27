@@ -1,3 +1,5 @@
+"""Decision-making agent that orchestrates LLM prompts and indicator lookups."""
+
 import requests
 from src.config_loader import CONFIG
 from src.indicators.taapi_client import TAAPIClient
@@ -6,7 +8,10 @@ import logging
 from datetime import datetime
 
 class TradingAgent:
+    """High-level trading agent that delegates reasoning to an LLM service."""
+
     def __init__(self):
+        """Initialize LLM configuration, metadata headers, and indicator helper."""
         self.model = CONFIG["llm_model"]
         self.api_key = CONFIG["openrouter_api_key"]
         base = CONFIG["openrouter_base_url"]
@@ -18,10 +23,19 @@ class TradingAgent:
         self.sanitize_model = CONFIG.get("sanitize_model") or "openai/gpt-5"
 
     def decide_trade(self, assets, context):
-        """Decide for multiple assets in one call. Returns list of dicts."""
+        """Decide for multiple assets in one call.
+
+        Args:
+            assets: Iterable of asset tickers to score.
+            context: Structured market/account state forwarded to the LLM.
+
+        Returns:
+            List of trade decision payloads, one per asset.
+        """
         return self._decide(context, assets=assets)
 
     def _decide(self, context, assets):
+        """Dispatch decision request to the LLM and enforce output contract."""
         system_prompt = (
             "You are a rigorous QUANTITATIVE TRADER and interdisciplinary MATHEMATICIAN-ENGINEER optimizing risk-adjusted returns for perpetual futures under real execution, margin, and funding constraints.\n"
             "You will receive market + account context for SEVERAL assets, including:\n"
@@ -31,6 +45,7 @@ class TradingAgent:
             "- Recent Trading History\n\n"
             "Always use the 'current time' provided in the user message to evaluate any time-based conditions, such as cooldown expirations or timed exit plans.\n\n"
             "Your goal: make decisive, first-principles decisions per asset that minimize churn while capturing edge.\n\n"
+            "Aggressively pursue setups where calculated risk is outweighed by expected edge; size positions so downside is controlled while upside remains meaningful.\n\n"
             "Core policy (low-churn, position-aware)\n"
             "1) Respect prior plans: If an active trade has an exit_plan with explicit invalidation (e.g., “close if 4h close above EMA50”), DO NOT close or flip early unless that invalidation (or a stronger one) has occurred.\n"
             "2) Hysteresis: Require stronger evidence to CHANGE a decision than to keep it. Only flip direction if BOTH:\n"
@@ -43,6 +58,7 @@ class TradingAgent:
             "6) Prefer adjustments over exits: If the thesis weakens but is not invalidated, first consider: tighten stop (e.g., to a recent swing or ATR multiple), trail TP, or reduce size. Flip only on hard invalidation + fresh confluence.\n\n"
             "Decision discipline (per asset)\n"
             "- Choose one: buy / sell / hold.\n"
+            "- Proactively harvest profits when price action presents a clear, high-quality opportunity that aligns with your thesis.\n"
             "- You control allocation_usd.\n"
             "- TP/SL sanity:\n"
             "  • BUY: tp_price > current_price, sl_price < current_price\n"
@@ -50,18 +66,22 @@ class TradingAgent:
             "  If sensible TP/SL cannot be set, use null and explain the logic.\n"
             "- exit_plan must include at least ONE explicit invalidation trigger and may include cooldown guidance you will follow later.\n\n"
             "Leverage policy (perpetual futures)\n"
-            "- YOU CAN USE LEVERAGE, ATLEAST 2X LEVERAGE TO GET BETTER RETURN, KEEP IT WITHIN 5X IN TOTAL\n"
+            "- YOU CAN USE LEVERAGE, ATLEAST 3X LEVERAGE TO GET BETTER RETURN, KEEP IT WITHIN 10X IN TOTAL\n"
             "- In high volatility (elevated ATR) or during funding spikes, reduce or avoid leverage.\n"
             "- Treat allocation_usd as notional exposure; keep it consistent with safe leverage and available margin.\n\n"
             "Tool usage\n"
-            "- Call fetch_taapi_indicator ONLY if one specific reading would materially change your decision. Keep parameters minimal (indicator, symbol like \"BTC/USDT\", interval \"5m\"/\"4h\", optional period).\n\n"
-            "- Tool usage is recommended, in case you don't feel confident enough with provided indicators or if you want more information."
+            "- Aggressively leverage fetch_taapi_indicator whenever an additional datapoint could sharpen your thesis; keep parameters minimal (indicator, symbol like \"BTC/USDT\", interval \"5m\"/\"4h\", optional period).\n"
+            "- Incorporate tool findings into your reasoning, but NEVER paste raw tool responses into the final JSON—summarize the insight instead.\n"
+            "- Use tools to upgrade your analysis; lack of confidence is a cue to query them before deciding."
             "Reasoning recipe (first principles)\n"
             "- Structure (trend, EMAs slope/cross, HH/HL vs LH/LL), Momentum (MACD regime, RSI slope), Liquidity/volatility (ATR, volume), Positioning tilt (funding, OI).\n"
             "- Favor alignment across 4h and 5m. Counter-trend scalps require stronger intraday confirmation and tighter risk.\n\n"
             "Output contract\n"
-            "- Output STRICT JSON array (no Markdown, no extra text), one object per asset in the SAME ORDER as the provided assets list.\n"
-            "- Exact keys for each object: {asset, action, allocation_usd, tp_price, sl_price, exit_plan, rationale}\n"
+            "- Output a STRICT JSON object with exactly two properties in this order:\n"
+            "  • reasoning: long-form string capturing detailed, step-by-step analysis that means you can acknowledge existing information as clarity, or acknowledge that you need more information to make a decision (be verbose).\n"
+            "  • trade_decisions: array ordered to match the provided assets list.\n"
+            "- Each item inside trade_decisions must contain the keys {asset, action, allocation_usd, tp_price, sl_price, exit_plan, rationale}.\n"
+            "- Do not emit Markdown or any extra properties.\n"
         )
         user_prompt = context
         messages = [
@@ -103,28 +123,30 @@ class TradingAgent:
             headers["X-Title"] = self.app_title
 
         def _post(payload):
+            """Send a POST request to OpenRouter, logging request and response metadata."""
             # Log the full request payload for debugging
-            logging.info(f"Sending request to OpenRouter (model: {payload.get('model')})")
-            with open("llm_requests.log", "a") as f:
+            logging.info("Sending request to OpenRouter (model: %s)", payload.get('model'))
+            with open("llm_requests.log", "a", encoding="utf-8") as f:
                 f.write(f"\n\n=== {datetime.now()} ===\n")
                 f.write(f"Model: {payload.get('model')}\n")
                 f.write(f"Headers: {json.dumps({k: v for k, v in headers.items() if k != 'Authorization'})}\n")
                 f.write(f"Payload:\n{json.dumps(payload, indent=2)}\n")
             resp = requests.post(self.base_url, headers=headers, json=payload, timeout=60)
-            logging.info(f"Received response from OpenRouter (status: {resp.status_code})")
+            logging.info("Received response from OpenRouter (status: %s)", resp.status_code)
             if resp.status_code != 200:
-                logging.error(f"OpenRouter error: {resp.status_code} - {resp.text}")
-                with open("llm_requests.log", "a") as f:
+                logging.error("OpenRouter error: %s - %s", resp.status_code, resp.text)
+                with open("llm_requests.log", "a", encoding="utf-8") as f:
                     f.write(f"ERROR Response: {resp.status_code} - {resp.text}\n")
             resp.raise_for_status()
             return resp.json()
 
-        def _sanitize_to_array(raw_content: str, assets_list):
-            """Use a fast model to coerce any content into the exact JSON array schema."""
+        def _sanitize_output(raw_content: str, assets_list):
+            """Coerce arbitrary LLM output into the required reasoning + decisions schema."""
             try:
                 schema = {
                     "type": "object",
                     "properties": {
+                        "reasoning": {"type": "string"},
                         "trade_decisions": {
                             "type": "array",
                             "items": {
@@ -144,7 +166,7 @@ class TradingAgent:
                             "minItems": 1,
                         }
                     },
-                    "required": ["trade_decisions"],
+                    "required": ["reasoning", "trade_decisions"],
                     "additionalProperties": False,
                 }
                 payload = {
@@ -169,41 +191,27 @@ class TradingAgent:
                 resp = _post(payload)
                 msg = resp.get("choices", [{}])[0].get("message", {})
                 parsed = msg.get("parsed")
-                if isinstance(parsed, list):
-                    return parsed
                 if isinstance(parsed, dict):
-                    arr = parsed.get("trade_decisions")
-                    if not isinstance(arr, list) and len(parsed) == 1:
-                        v = list(parsed.values())[0]
-                        if isinstance(v, list):
-                            arr = v
-                    if isinstance(arr, list):
-                        return arr
+                    if "trade_decisions" in parsed:
+                        return parsed
                 # fallback: try content
                 content = msg.get("content") or "[]"
                 try:
                     loaded = json.loads(content)
-                    if isinstance(loaded, dict):
-                        arr = loaded.get("trade_decisions")
-                        if not isinstance(arr, list) and len(loaded) == 1:
-                            v = list(loaded.values())[0]
-                            if isinstance(v, list):
-                                arr = v
-                        if isinstance(arr, list):
-                            return arr
-                    if isinstance(loaded, list):
+                    if isinstance(loaded, dict) and "trade_decisions" in loaded:
                         return loaded
-                except Exception:
+                except (json.JSONDecodeError, KeyError, ValueError, TypeError):
                     pass
-                return []
-            except Exception as se:
-                logging.error(f"Sanitize failed: {se}")
-                return []
+                return {"reasoning": "", "trade_decisions": []}
+            except (requests.RequestException, json.JSONDecodeError, KeyError, ValueError, TypeError) as se:
+                logging.error("Sanitize failed: %s", se)
+                return {"reasoning": "", "trade_decisions": []}
 
         allow_tools = True
         allow_structured = True
 
         def _build_schema():
+            """Assemble the JSON schema used for structured LLM responses."""
             base_properties = {
                 "asset": {"type": "string", "enum": assets},
                 "action": {"type": "string", "enum": ["buy", "sell", "hold"]},
@@ -217,6 +225,7 @@ class TradingAgent:
             return {
                 "type": "object",
                 "properties": {
+                    "reasoning": {"type": "string"},
                     "trade_decisions": {
                         "type": "array",
                         "items": {
@@ -228,7 +237,7 @@ class TradingAgent:
                         "minItems": 1,
                     }
                 },
-                "required": ["trade_decisions"],
+                "required": ["reasoning", "trade_decisions"],
                 "additionalProperties": False,
             }
 
@@ -246,12 +255,25 @@ class TradingAgent:
             if allow_tools:
                 data["tools"] = tools
                 data["tool_choice"] = "auto"
+            if CONFIG.get("reasoning_enabled"):
+                data["reasoning"] = {
+                    "enabled": True,
+                    "effort": CONFIG.get("reasoning_effort") or "high",
+                    # "max_tokens": CONFIG.get("reasoning_max_tokens") or 100000,
+                    "exclude": False,
+                }
+            if CONFIG.get("provider_config") or CONFIG.get("provider_quantizations"):
+                provider_payload = dict(CONFIG.get("provider_config") or {})
+                quantizations = CONFIG.get("provider_quantizations")
+                if quantizations:
+                    provider_payload["quantizations"] = quantizations
+                data["provider"] = provider_payload
             try:
                 resp_json = _post(data)
             except requests.HTTPError as e:
                 try:
                     err = e.response.json()
-                except Exception:
+                except (json.JSONDecodeError, ValueError, AttributeError):
                     err = {}
                 raw = (err.get("error", {}).get("metadata", {}) or {}).get("raw", "")
                 provider = (err.get("error", {}).get("metadata", {}) or {}).get("provider_name", "")
@@ -290,14 +312,14 @@ class TradingAgent:
                                 params["backtrack"] = args["backtrack"]
                             if isinstance(args.get("other_params"), dict):
                                 params.update(args["other_params"])
-                            ind_resp = requests.get(f"{self.taapi.base_url}{args['indicator']}", params=params).json()
+                            ind_resp = requests.get(f"{self.taapi.base_url}{args['indicator']}", params=params, timeout=30).json()
                             messages.append({
                                 "role": "tool",
                                 "tool_call_id": tc.get("id"),
                                 "name": "fetch_taapi_indicator",
                                 "content": json.dumps(ind_resp),
                             })
-                        except Exception as ex:
+                        except (requests.RequestException, json.JSONDecodeError, KeyError, ValueError) as ex:
                             messages.append({
                                 "role": "tool",
                                 "tool_call_id": tc.get("id"),
@@ -308,32 +330,34 @@ class TradingAgent:
 
             try:
                 # Prefer parsed field from structured outputs if present
-                if isinstance(message.get("parsed"), (dict, list)):
+                if isinstance(message.get("parsed"), dict):
                     parsed = message.get("parsed")
                 else:
                     content = message.get("content") or "{}"
                     parsed = json.loads(content)
-                
-                # Unwrap if provider wrapped the array in a dict (e.g., {"trade_decisions": [...]})
-                if isinstance(parsed, dict):
-                    if len(parsed) == 1:
-                        key = list(parsed.keys())[0]
-                        if isinstance(parsed[key], list):
-                            parsed = parsed[key]
-                
-                if isinstance(parsed, list):
-                    result = []
-                    for item in parsed:
+
+                if not isinstance(parsed, dict):
+                    logging.error("Expected dict payload, got: %s; attempting sanitize", type(parsed))
+                    sanitized = _sanitize_output(content if 'content' in locals() else json.dumps(parsed), assets)
+                    if sanitized.get("trade_decisions"):
+                        return sanitized
+                    return {"reasoning": "", "trade_decisions": []}
+
+                reasoning_text = parsed.get("reasoning", "") or ""
+                decisions = parsed.get("trade_decisions")
+
+                if isinstance(decisions, list):
+                    normalized = []
+                    for item in decisions:
                         if isinstance(item, dict):
                             item.setdefault("allocation_usd", 0.0)
                             item.setdefault("tp_price", None)
                             item.setdefault("sl_price", None)
                             item.setdefault("exit_plan", "")
                             item.setdefault("rationale", "")
-                            result.append(item)
+                            normalized.append(item)
                         elif isinstance(item, list) and len(item) >= 7:
-                            # Handle array format: [asset, action, alloc, tp, sl, exit_plan, rationale]
-                            result.append({
+                            normalized.append({
                                 "asset": item[0],
                                 "action": item[1],
                                 "allocation_usd": float(item[2]) if item[2] else 0.0,
@@ -342,35 +366,41 @@ class TradingAgent:
                                 "exit_plan": item[5] if len(item) > 5 else "",
                                 "rationale": item[6] if len(item) > 6 else ""
                             })
-                    return result
-                else:
-                    logging.error(f"Expected array, got: {type(parsed)}; attempting sanitize")
-                    sanitized = _sanitize_to_array(content if 'content' in locals() else json.dumps(parsed), assets)
-                    if isinstance(sanitized, list) and sanitized:
-                        return sanitized
-                    return []
-            except Exception as e:
-                logging.error(f"JSON parse error: {e}, content: {content[:200]}")
-                # Try sanitizer as last resort
-                sanitized = _sanitize_to_array(content, assets)
-                if isinstance(sanitized, list) and sanitized:
-                    return sanitized
-                return [{
-                    "asset": a,
-                    "action": "hold",
-                    "allocation_usd": 0.0,
-                    "tp_price": None,
-                    "sl_price": None,
-                    "exit_plan": "",
-                    "rationale": "Parse error"
-                } for a in assets]
+                    return {"reasoning": reasoning_text, "trade_decisions": normalized}
 
-        return [{
-            "asset": a,
-            "action": "hold",
-            "allocation_usd": 0.0,
-            "tp_price": None,
-            "sl_price": None,
-            "exit_plan": "",
-            "rationale": "tool loop cap"
-        } for a in assets]
+                logging.error("trade_decisions missing or invalid; attempting sanitize")
+                sanitized = _sanitize_output(content if 'content' in locals() else json.dumps(parsed), assets)
+                if sanitized.get("trade_decisions"):
+                    return sanitized
+                return {"reasoning": reasoning_text, "trade_decisions": []}
+            except (json.JSONDecodeError, KeyError, ValueError, TypeError) as e:
+                logging.error("JSON parse error: %s, content: %s", e, content[:200])
+                # Try sanitizer as last resort
+                sanitized = _sanitize_output(content, assets)
+                if sanitized.get("trade_decisions"):
+                    return sanitized
+                return {
+                    "reasoning": "Parse error",
+                    "trade_decisions": [{
+                        "asset": a,
+                        "action": "hold",
+                        "allocation_usd": 0.0,
+                        "tp_price": None,
+                        "sl_price": None,
+                        "exit_plan": "",
+                        "rationale": "Parse error"
+                    } for a in assets]
+                }
+
+        return {
+            "reasoning": "tool loop cap",
+            "trade_decisions": [{
+                "asset": a,
+                "action": "hold",
+                "allocation_usd": 0.0,
+                "tp_price": None,
+                "sl_price": None,
+                "exit_plan": "",
+                "rationale": "tool loop cap"
+            } for a in assets]
+        }

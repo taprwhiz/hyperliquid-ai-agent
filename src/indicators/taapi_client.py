@@ -1,16 +1,22 @@
+"""Client helper for interacting with the TAAPI technical analysis API."""
+
 import requests
 import os
 import time
 import logging
 from src.config_loader import CONFIG
 
+
 class TAAPIClient:
+    """Fetches TA indicators with retry/backoff semantics for resilience."""
+
     def __init__(self):
+        """Initialize TAAPI credentials and base URL."""
         self.api_key = CONFIG["taapi_api_key"]
         self.base_url = "https://api.taapi.io/"
 
     def _get_with_retry(self, url, params, retries=3, backoff=0.5):
-        """GET with exponential backoff retry."""
+        """Perform a GET request with exponential backoff retry logic."""
         for attempt in range(retries):
             try:
                 resp = requests.get(url, params=params, timeout=10)
@@ -33,6 +39,7 @@ class TAAPIClient:
         raise RuntimeError("Max retries exceeded")
 
     def get_indicators(self, asset, interval):
+        """Return a curated bundle of intraday indicators for ``asset``."""
         params = {
             "secret": self.api_key,
             "exchange": "binance",
@@ -53,6 +60,7 @@ class TAAPIClient:
         }
 
     def get_historical_indicator(self, indicator, symbol, interval, results=10, params=None):
+        """Fetch historical indicator data with optional overrides."""
         base_params = {
             "secret": self.api_key,
             "exchange": "binance",
@@ -66,7 +74,19 @@ class TAAPIClient:
         return response
 
     def fetch_series(self, indicator: str, symbol: str, interval: str, results: int = 10, params: dict | None = None, value_key: str = "value") -> list:
-        """Fetch historical series. TAAPI returns {"value": [array]} for simple indicators or {"valueMACD": [...], ...} for complex ones."""
+        """Fetch and normalize a historical indicator series.
+
+        Args:
+            indicator: TAAPI indicator slug (e.g. ``"ema"``).
+            symbol: Market pair identifier (e.g. ``"BTC/USDT"``).
+            interval: Candle interval requested from TAAPI.
+            results: Number of datapoints to request.
+            params: Additional TAAPI query parameters.
+            value_key: Key to extract from the TAAPI response payload.
+
+        Returns:
+            List of floats rounded to 4 decimals, or an empty list on error.
+        """
         try:
             data = self.get_historical_indicator(indicator, symbol, interval, results=results, params=params)
             if isinstance(data, dict):
@@ -85,7 +105,7 @@ class TAAPIClient:
             return []
 
     def fetch_value(self, indicator: str, symbol: str, interval: str, params: dict | None = None, key: str = "value"):
-        """Fetch single value (no results param). TAAPI returns {"value": number}."""
+        """Fetch a single indicator value for the latest candle."""
         try:
             base_params = {
                 "secret": self.api_key,
