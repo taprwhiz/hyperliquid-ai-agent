@@ -2,9 +2,17 @@
 
 import json
 import os
+import re
 from dotenv import load_dotenv
 
 load_dotenv()
+
+_PLACEHOLDER_PATTERNS = (
+    r"your_.*_here",
+    r"replace[_-]?me",
+    r"changeme",
+    r"xxx+",
+)
 
 
 def _get_env(name: str, default: str | None = None, required: bool = False) -> str | None:
@@ -68,9 +76,36 @@ def _get_list(name: str, default: list[str] | None = None) -> list[str] | None:
     return values or default
 
 
+def _looks_like_placeholder(value: str) -> bool:
+    lowered = value.strip().lower()
+    return any(re.search(pattern, lowered) for pattern in _PLACEHOLDER_PATTERNS)
+
+
+def _normalize_private_key(raw: str | None, env_name: str) -> str | None:
+    """Validate wallet private key format and reject template placeholders."""
+    if raw is None or raw.strip() == "":
+        return None
+    value = raw.strip()
+    if _looks_like_placeholder(value):
+        raise RuntimeError(
+            f"{env_name} still contains a placeholder value. "
+            "Set a real 32-byte hex private key before starting the agent."
+        )
+    normalized = value[2:] if value.lower().startswith("0x") else value
+    if not re.fullmatch(r"[0-9a-fA-F]{64}", normalized):
+        raise RuntimeError(
+            f"Invalid {env_name}: expected 64 hex characters (optional 0x prefix), "
+            f"got {len(normalized)} characters."
+        )
+    return f"0x{normalized.lower()}"
+
+
 CONFIG = {
     "taapi_api_key": _get_env("TAAPI_API_KEY", required=True),
-    "hyperliquid_private_key": _get_env("HYPERLIQUID_PRIVATE_KEY") or _get_env("LIGHTER_PRIVATE_KEY"),
+    "hyperliquid_private_key": _normalize_private_key(
+        _get_env("HYPERLIQUID_PRIVATE_KEY") or _get_env("LIGHTER_PRIVATE_KEY"),
+        "HYPERLIQUID_PRIVATE_KEY",
+    ),
     "mnemonic": _get_env("MNEMONIC"),
     # Hyperliquid network/base URL overrides
     "hyperliquid_base_url": _get_env("HYPERLIQUID_BASE_URL"),
@@ -81,6 +116,7 @@ CONFIG = {
     "openrouter_referer": _get_env("OPENROUTER_REFERER"),
     "openrouter_app_title": _get_env("OPENROUTER_APP_TITLE", "trading-agent"),
     "llm_model": _get_env("LLM_MODEL", "x-ai/grok-4"),
+    "sanitize_model": _get_env("SANITIZE_MODEL", "openai/gpt-5"),
     # Reasoning tokens
     "reasoning_enabled": _get_bool("REASONING_ENABLED", False),
     "reasoning_effort": _get_env("REASONING_EFFORT", "high"),
