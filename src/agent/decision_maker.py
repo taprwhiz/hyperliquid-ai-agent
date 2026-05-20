@@ -72,7 +72,7 @@ class TradingAgent:
             "Tool usage\n"
             "- Aggressively leverage fetch_taapi_indicator whenever an additional datapoint could sharpen your thesis; keep parameters minimal (indicator, symbol like \"BTC/USDT\", interval \"5m\"/\"4h\", optional period).\n"
             "- Incorporate tool findings into your reasoning, but NEVER paste raw tool responses into the final JSON—summarize the insight instead.\n"
-            "- Use tools to upgrade your analysis; lack of confidence is a cue to query them before deciding."
+            "- Use tools to upgrade your analysis; lack of confidence is a cue to query them before deciding.\n"
             "Reasoning recipe (first principles)\n"
             "- Structure (trend, EMAs slope/cross, HH/HL vs LH/LL), Momentum (MACD regime, RSI slope), Liquidity/volatility (ATR, volume), Positioning tilt (funding, OI).\n"
             "- Favor alignment across 4h and 5m. Counter-trend scalps require stronger intraday confirmation and tighter risk.\n\n"
@@ -207,6 +207,21 @@ class TradingAgent:
                 logging.error("Sanitize failed: %s", se)
                 return {"reasoning": "", "trade_decisions": []}
 
+        def _hold_all(reason: str):
+            """Return a safe hold-only payload when the LLM request fails."""
+            return {
+                "reasoning": reason,
+                "trade_decisions": [{
+                    "asset": a,
+                    "action": "hold",
+                    "allocation_usd": 0.0,
+                    "tp_price": None,
+                    "sl_price": None,
+                    "exit_plan": "",
+                    "rationale": reason,
+                } for a in assets],
+            }
+
         allow_tools = True
         allow_structured = True
 
@@ -272,23 +287,27 @@ class TradingAgent:
                 resp_json = _post(data)
             except requests.HTTPError as e:
                 try:
-                    err = e.response.json()
+                    err = e.response.json() if e.response is not None else {}
                 except (json.JSONDecodeError, ValueError, AttributeError):
                     err = {}
                 raw = (err.get("error", {}).get("metadata", {}) or {}).get("raw", "")
                 provider = (err.get("error", {}).get("metadata", {}) or {}).get("provider_name", "")
-                if e.response.status_code == 422 and provider.lower().startswith("xai") and "deserialize" in raw.lower():
+                status = e.response.status_code if e.response is not None else None
+                if status == 422 and provider.lower().startswith("xai") and "deserialize" in raw.lower():
                     logging.warning("xAI rejected tool schema; retrying without tools.")
                     if allow_tools:
                         allow_tools = False
                         continue
-                # Provider may not support structured outputs / response_format
                 err_text = json.dumps(err)
-                if allow_structured and ("response_format" in err_text or "structured" in err_text or e.response.status_code in (400, 422)):
+                if allow_structured and ("response_format" in err_text or "structured" in err_text or status in (400, 422)):
                     logging.warning("Provider rejected structured outputs; retrying without response_format.")
                     allow_structured = False
                     continue
-                raise
+                logging.error("OpenRouter request failed with HTTP %s", status)
+                return _hold_all(f"LLM request failed (HTTP {status})")
+            except requests.RequestException as e:
+                logging.error("OpenRouter request failed: %s", e)
+                return _hold_all(f"LLM request failed ({e.__class__.__name__})")
 
             choice = resp_json["choices"][0]
             message = choice["message"]
