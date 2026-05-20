@@ -359,8 +359,9 @@ def main():
                     if not asset or asset not in args.assets:
                         continue
                     action = output.get("action")
+                    if not action:
+                        continue
                     current_price = asset_prices.get(asset, 0)
-                    action = output["action"]
                     rationale = output.get("rationale", "")
                     if rationale:
                         add_event(f"Decision rationale for {asset}: {rationale}")
@@ -370,7 +371,13 @@ def main():
                         if alloc_usd <= 0:
                             add_event(f"Holding {asset}: zero/negative allocation")
                             continue
+                        if not current_price:
+                            add_event(f"Skipping {asset}: missing current price")
+                            continue
                         amount = alloc_usd / current_price
+                        exit_plan = output.get("exit_plan", "")
+                        tp_price = output.get("tp_price")
+                        sl_price = output.get("sl_price")
 
                         order = await hyperliquid.place_buy_order(asset, amount) if is_buy else await hyperliquid.place_sell_order(asset, amount)
                         # Confirm by checking recent fills for this asset shortly after placing
@@ -384,19 +391,19 @@ def main():
                                     break
                             except Exception:
                                 continue
-                        trade_log.append({"type": action, "price": current_price, "amount": amount, "exit_plan": output["exit_plan"], "filled": filled})
+                        trade_log.append({"type": action, "price": current_price, "amount": amount, "exit_plan": exit_plan, "filled": filled})
                         tp_oid = None
                         sl_oid = None
-                        if output["tp_price"]:
-                            tp_order = await hyperliquid.place_take_profit(asset, is_buy, amount, output["tp_price"])
+                        if tp_price:
+                            tp_order = await hyperliquid.place_take_profit(asset, is_buy, amount, tp_price)
                             tp_oids = hyperliquid.extract_oids(tp_order)
                             tp_oid = tp_oids[0] if tp_oids else None
-                            add_event(f"TP placed {asset} at {output['tp_price']}")
-                        if output["sl_price"]:
-                            sl_order = await hyperliquid.place_stop_loss(asset, is_buy, amount, output["sl_price"])
+                            add_event(f"TP placed {asset} at {tp_price}")
+                        if sl_price:
+                            sl_order = await hyperliquid.place_stop_loss(asset, is_buy, amount, sl_price)
                             sl_oids = hyperliquid.extract_oids(sl_order)
                             sl_oid = sl_oids[0] if sl_oids else None
-                            add_event(f"SL placed {asset} at {output['sl_price']}")
+                            add_event(f"SL placed {asset} at {sl_price}")
                         # Reconcile: if opposite-side position exists or TP/SL just filled, clear stale active_trades for this asset
                         for existing in active_trades[:]:
                             if existing.get('asset') == asset:
@@ -411,7 +418,7 @@ def main():
                             "entry_price": current_price,
                             "tp_oid": tp_oid,
                             "sl_oid": sl_oid,
-                            "exit_plan": output["exit_plan"],
+                            "exit_plan": exit_plan,
                             "opened_at": datetime.now().isoformat()
                         })
                         add_event(f"{action.upper()} {asset} amount {amount:.4f} at ~{current_price}")
