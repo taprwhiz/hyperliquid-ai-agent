@@ -21,7 +21,7 @@ There is no guarantee of any returns. This code has not been audited. Please use
 
 See the full [Architecture Documentation](docs/ARCHITECTURE.md) for subsystems, data flow, and design principles.
 
-![ETH Funding Rate Timeline Comparison - Q3 2025](docs/assets/eth-funding-rate-timeline-q3-2025.png)
+![Taprwhiz AI Trading Agent on Hyperliquid](docs/assets/hyperliquid_project_60ab126a21.webp)
 
 ## Taprwhiz Live Agents 
 
