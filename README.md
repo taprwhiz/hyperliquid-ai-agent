@@ -1,4 +1,5 @@
 # Taprwhiz: AI Trading Agent on Hyperliquid
+<img width="1424" height="720" alt="image" src="https://github.com/user-attachments/assets/256241a1-a2ed-4830-96d4-6ffbbda75a77" />
 
 This project implements an AI-powered trading agent that leverages LLM models to analyze real-time market data from TAAPI, make informed trading decisions, and execute trades on the Hyperliquid decentralized exchange. The agent runs in a continuous loop, monitoring specified cryptocurrency assets at configurable intervals, using technical indicators to decide on buy/sell/hold actions, and manages positions with take-profit and stop-loss orders.
 
@@ -20,8 +21,6 @@ There is no guarantee of any returns. This code has not been audited. Please use
 ## Architecture
 
 See the full [Architecture Documentation](docs/ARCHITECTURE.md) for subsystems, data flow, and design principles.
-
-![Taprwhiz AI Trading Agent on Hyperliquid](docs/assets/hyperliquid_project_60ab126a21.webp)
 
 ## Taprwhiz Live Agents 
 
