@@ -1,4 +1,4 @@
-# Nocturne: AI Trading Agent on Hyperliquid
+# Taprwhiz: AI Trading Agent on Hyperliquid
 
 This project implements an AI-powered trading agent that leverages LLM models to analyze real-time market data from TAAPI, make informed trading decisions, and execute trades on the Hyperliquid decentralized exchange. The agent runs in a continuous loop, monitoring specified cryptocurrency assets at configurable intervals, using technical indicators to decide on buy/sell/hold actions, and manages positions with take-profit and stop-loss orders.
 
@@ -6,7 +6,7 @@ This project implements an AI-powered trading agent that leverages LLM models to
 
 - [Disclaimer](#disclaimer)
 - [Architecture](#architecture)
-- [Nocturne Live Agents](#nocturne-live-agents)
+- [Taprwhiz Live Agents](#taprwhiz-live-agents)
 - [Structure](#structure)
 - [Env Configuration](#env-configuration)
 - [Usage](#usage)
@@ -21,9 +21,9 @@ There is no guarantee of any returns. This code has not been audited. Please use
 
 See the full [Architecture Documentation](docs/ARCHITECTURE.md) for subsystems, data flow, and design principles.
 
-![Architecture Diagram](docs/architecture.png)
+![ETH Funding Rate Timeline Comparison - Q3 2025](docs/assets/eth-funding-rate-timeline-q3-2025.png)
 
-## Nocturne Live Agents 
+## Taprwhiz Live Agents 
 
 - GPT-5 Pro: [Portfolio Dashboard](https://hypurrscan.io/address/0xa049db4b3dfcb25c3092891010a629d987d26113) | [Live Logs](https://35.190.43.182/logs/0xC0BE8E55f469c1a04c0F6d04356828C5793d8a9D) (Seeded with $200)
 - DeepSeek R1: [Portfolio Dashboard](https://hypurrscan.io/address/0xa663c80d86fd7c045d9927bb6344d7a5827d31db) | [Live Logs](https://35.190.43.182/logs/0x4da68B78ef40D12f378b8498120f2F5A910Af1aD) (Seeded with $100) -- PAUSED
