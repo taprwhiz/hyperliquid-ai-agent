@@ -30,11 +30,11 @@ See the full [Architecture Documentation](docs/ARCHITECTURE.md) for subsystems, 
 - Grok 4: [Portfolio Dashboard](https://hypurrscan.io/address/0x3c71f3cf324d0133558c81d42543115ef1a2be79) | [Live Logs](https://35.190.43.182/logs/0xe6a9f97f99847215ea5813812508e9354a22A2e0) (Seeded with $100) -- PAUSED
 
 ## Structure
-- `src/main.py`: Entry point, handles user input and main trading loop.
-- `src/agent/decision_maker.py`: LLM logic for trade decisions (OpenRouter with tool calling for TAAPI indicators).
-- `src/indicators/taapi_client.py`: Fetches indicators from TAAPI.
-- `src/trading/hyperliquid_api.py`: Executes trades on Hyperliquid.
-- `src/config_loader.py`: Centralized config loaded from `.env`.
+- `src/index.ts`: Entry point, CLI parsing, API server, and trading loop bootstrap.
+- `src/agent/decision-maker.ts`: LLM logic for trade decisions (OpenRouter with tool calling for TAAPI indicators).
+- `src/indicators/taapi-client.ts`: Fetches indicators from TAAPI.
+- `src/trading/hyperliquid-api.ts`: Executes trades on Hyperliquid.
+- `src/config/settings.ts`: Centralized config loaded from `.env`.
 
 ## Env Configuration
 Populate `.env` (use `.env.example` as reference):
@@ -51,7 +51,14 @@ Populate `.env` (use `.env.example` as reference):
 - **LLM_MODEL**: No key needed; specify a model name like "x-ai/grok-4" (see OpenRouter models list).
 
 ## Usage
-Run: `poetry run python src/main.py --assets BTC ETH --interval 1h`
+Run: `npm run dev -- --assets BTC ETH --interval 1h`
+
+Or after building:
+```bash
+npm install
+npm run build
+npm start -- --assets BTC ETH --interval 1h
+```
 
 ### Local API Endpoints
 When the agent runs, it also serves a minimal API:

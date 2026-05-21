@@ -1,29 +1,15 @@
-FROM python:3.12-slim
-
-# System deps
-RUN apt-get update && apt-get install -y --no-install-recommends \
-    build-essential curl ca-certificates git && \
-    rm -rf /var/lib/apt/lists/*
+FROM node:22-slim
 
 WORKDIR /app
 
-# Copy project metadata and install deps
-COPY pyproject.toml poetry.lock ./
+COPY package.json package-lock.json* ./
+RUN npm ci --omit=dev 2>/dev/null || npm install --omit=dev
 
-# Install Poetry lightweightly
-ENV POETRY_VIRTUALENVS_CREATE=false \
-    POETRY_NO_INTERACTION=1
-RUN pip install --no-cache-dir poetry && \
-    poetry install --no-interaction --no-ansi --no-root
-
-# Copy source
+COPY tsconfig.json tsup.config.ts ./
 COPY src ./src
+RUN npm install && npm run build && npm prune --omit=dev
 
-# API defaults
 ENV APP_PORT=3000
 EXPOSE 3000
 
-# Default command: run as module to keep absolute imports working
-ENTRYPOINT ["poetry", "run", "python", "-m", "src.main"]
-
-
+CMD ["node", "dist/index.js"]

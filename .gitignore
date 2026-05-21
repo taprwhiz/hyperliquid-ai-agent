@@ -1,19 +1,27 @@
+# Dependencies
+node_modules/
+
+# Build
+dist/
+
 # Environments
 .env
 .env.*
 !.env.example
 
-# Python
+# Runtime artifacts
+llm_requests.log
+trading_history.log
+prompts.log
+*.log
+diary.jsonl
+
+# Python legacy
 __pycache__/
 *.py[cod]
-*.pyo
-*.pyd
-*.egg-info/
-*.egg
-
-# Virtual envs
 .venv/
 venv/
+.poetry/
 
 # Editors/OS
 .DS_Store
@@ -21,11 +29,4 @@ venv/
 .vscode/
 
 # Caches
-.pytest_cache/
-.mypy_cache/
 .cache/
-
-llm_requests.log
-trading_history.log
-*.log
-diary.jsonl

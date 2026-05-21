@@ -1,1 +1,0 @@
-"""Technical indicator data providers."""
